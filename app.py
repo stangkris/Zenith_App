@@ -2646,8 +2646,8 @@ def main() -> None:
             refresh = st.button("📊 Analyze", use_container_width=True)
             st.markdown("<div class='side-spacer'></div>", unsafe_allow_html=True)
             _patch_note_content = (
-                "<h3 style='margin:0 0 6px 0;color:#0f766e;'>🔬 Patch Note — V1.1.0</h3>"
-                "<p style='font-size:12px;color:#64748b;margin:0 0 10px 0;'>Release Date: 2026-02-16</p>"
+                "<h3 style='margin:0 0 6px 0;color:#0f766e;'>🔬 Patch Note — V1.1.1</h3>"
+                "<p style='font-size:12px;color:#64748b;margin:0 0 10px 0;'>Release Date: 2026-02-17</p>"
                 "<hr style='border:none;border-top:1px solid #e2e8f0;margin:8px 0;'>"
                 # ── Major Changes: What & Why ──
                 "<div style='background:#f0fdfa;padding:12px;border-radius:8px;border:1px solid #ccfbf1;margin-bottom:10px;'>"
