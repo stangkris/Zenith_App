@@ -1610,8 +1610,8 @@ def fetch_ohlcv_twelvedata(symbol: str, api_key: str, interval: str) -> pd.DataF
     params = {
         "symbol": symbol,
         "interval": interval,
-        "start_date": start.strftime("%Y-%m-%d"),
-        "end_date": end.strftime("%Y-%m-%d"),
+        "start_date": start.strftime("%Y-%m-%d %H:%M:%S"),
+        "end_date": end.strftime("%Y-%m-%d %H:%M:%S"),
         "outputsize": 5000,
         "format": "JSON",
         "timezone": "Asia/Bangkok",
@@ -1835,25 +1835,20 @@ def resolve_market_mode_twelvedata(symbol: str, api_key: str) -> str:
 
 def to_plot_timestamps(ts: pd.Series, market_mode: str) -> pd.Series:
     parsed = pd.to_datetime(ts, errors="coerce")
-    if market_mode != "us_equity":
-        return parsed
-
     if getattr(parsed.dt, "tz", None) is None:
         parsed = parsed.dt.tz_localize("Asia/Bangkok")
     else:
         parsed = parsed.dt.tz_convert("Asia/Bangkok")
-    return parsed.dt.tz_convert("America/New_York").dt.tz_localize(None)
+    return parsed.dt.tz_localize(None)
 
 
 def build_xaxis_rangebreaks(interval: str, market_mode: str) -> list[dict[str, Any]]:
     if market_mode == "crypto_24x7":
         return []
 
-    breaks: list[dict[str, Any]] = [dict(bounds=["sat", "mon"])]
-    if market_mode == "us_equity" and interval in {"15min", "1h", "4h"}:
-        # Market-time (NY) regular session: 09:30-16:00
-        breaks.append(dict(bounds=[16, 9.5], pattern="hour"))
-    return breaks
+    # Only hide weekends. Intraday gaps vary by DST in Thai time (21:30-04:00 vs 20:30-03:00)
+    # so we avoid hardcoded hour breaks to prevent hiding valid data.
+    return [dict(bounds=["sat", "mon"])]
 
 
 @st.cache_data(show_spinner=False, ttl=180)
