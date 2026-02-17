@@ -2299,10 +2299,12 @@ def make_figure(
         dragmode="pan",
         hovermode="closest",
         hoverdistance=8,
-        spikedistance=-1,
+        spikedistance=1000,
         uirevision=f"zenith-chart-{chart_revision}",
         showlegend=False,
     )
+    # Remove spikedistance=-1 (infinite) to reduce hover lag
+
     fig.update_annotations(font=dict(size=11, color="#475569"))
     fig.update_yaxes(
         title_text="Price",
@@ -2320,6 +2322,8 @@ def make_figure(
         spikecolor="#334155",
         spikethickness=1,
         hoverformat=".2f",
+        # Optimize Y-axis spikes
+        showspikes=False, 
     )
     fig.update_yaxes(
         title_text="Volume",
@@ -2383,7 +2387,7 @@ def make_figure(
         "4h": 320,
         "1day": 220,
     }.get(interval, len(df))
-    start_idx = max(0, len(df) - display_bars)
+    start_idx = 0 # Default to full view (Overview mode)
     x_start = plot_time.iloc[start_idx]
 
     right_pad = max(inferred_step * 2, pd.Timedelta(hours=2))
@@ -2395,7 +2399,7 @@ def make_figure(
     if interval in {"15min", "1h", "4h"}:
         fig.update_xaxes(
             rangebreaks=range_breaks,
-            tickformat="%d %b\n%H:%M" if interval != "4h" else "%d %b",
+            tickformat="%d %b %H:%M" if interval not in ("4h", "1day") else "%d %b %Y",
         )
     else:
         fig.update_xaxes(
@@ -2726,7 +2730,7 @@ def main() -> None:
             )
             st.markdown(
                 "<div class='side-footer'>"
-                "Zenith Analysis v1.1.1.1 | © 2026"
+                "Zenith Analysis v1.1.1 | © 2026"
                 "<br>Developed by: Krisanu Kinkhuntod"
                 "</div>",
                 unsafe_allow_html=True,
