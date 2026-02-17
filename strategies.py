@@ -192,9 +192,11 @@ def analyze_smc(df: pd.DataFrame) -> dict:
             zone_type = z_type
             break
 
-    volume_spike = float(df["volume"].iloc[-1]) > 2 * float(df["vol_sma20"].iloc[-1])
+    # Relaxed volume spike from 2x to 1.5x
+    volume_spike = float(df["volume"].iloc[-1]) > 1.5 * float(df["vol_sma20"].iloc[-1])
     candle_reversal_in_zone = zone_pass and bullish_candle_signal(df)
-    trigger_pass = candle_reversal_in_zone or volume_spike
+    # Allow trigger if EITHER candle signal OR volume spike (was previously combined or implicit)
+    trigger_pass = candle_reversal_in_zone or (zone_pass and volume_spike)
 
     trend_pass = len(bos_events) > 0
     checklist = {
@@ -261,7 +263,9 @@ def _is_tight_consolidation(df: pd.DataFrame, length: int = 10) -> bool:
         float(window["high"].iloc[-4:].max() - window["low"].iloc[-4:].min()),
     ]
     contracting = swings[2] <= swings[1] <= swings[0]
-    return width < 0.06 and contracting
+    contracting = swings[2] <= swings[1] <= swings[0]
+    # Relaxed from 0.06 to 0.15 (15%) to catch more setups
+    return width < 0.15 and contracting
 
 
 def analyze_momentum_breakout(df: pd.DataFrame) -> dict:
@@ -363,7 +367,8 @@ def analyze_pullback_reversal(df: pd.DataFrame) -> dict:
 
     trend_pass = last_close > ema200
     zone_pass = fib_bottom <= last_close <= fib_top
-    trigger_pass = (rsi < 30 or _bullish_divergence(df)) and bullish_candle_signal(df)
+    # Relaxed RSI from < 30 to < 40 for strong uptrend pullbacks
+    trigger_pass = (rsi < 40 or _bullish_divergence(df)) and bullish_candle_signal(df)
 
     sl = float(fib_bottom - df["atr14"].iloc[-1] * 0.5)
     entry = float(last_close)

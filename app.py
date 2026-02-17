@@ -74,123 +74,6 @@ BACKTEST_STRATEGY_LOOKBACK = {
 }
 
 
-def _calculate_backtest_metrics(df: pd.DataFrame, signals: pd.Series, interval: str, strategy_name: str) -> dict:
-    total_bars = int(len(df))
-    if total_bars == 0:
-        return {
-            "total_bars": 0,
-            "signal_count": 0,
-            "win_count": 0,
-            "loss_count": 0,
-            "breakeven_count": 0,
-            "canceled_count": 0,
-            "win_rate": 0.0,
-            "start": None,
-            "end": None,
-        }
-
-    start = df["timestamp"].iloc[0]
-    end = df["timestamp"].iloc[-1]
-
-    signal_idx = signals[signals].index.to_numpy()
-    signal_count = int(len(signal_idx))
-    if signal_count == 0:
-        return {
-            "total_bars": total_bars,
-            "signal_count": 0,
-            "win_count": 0,
-            "loss_count": 0,
-            "breakeven_count": 0,
-            "canceled_count": 0,
-            "win_rate": 0.0,
-            "start": start,
-            "end": end,
-        }
-
-    horizon = BACKTEST_HORIZON_BARS.get(interval, 12)
-    win_count = 0
-    loss_count = 0
-    breakeven_count = 0
-    canceled_count = 0
-
-    for idx in signal_idx:
-        si = int(idx)
-        if si >= total_bars - 3:
-            continue
-
-        try:
-            levels = run_strategy(df.iloc[: si + 1].copy(), strategy_name)
-        except Exception:
-            continue
-
-        entry = float(levels.get("entry", np.nan))
-        sl = float(levels.get("sl", np.nan))
-        tp = float(levels.get("tp", np.nan))
-        if not (np.isfinite(entry) and np.isfinite(sl) and np.isfinite(tp)):
-            continue
-        if tp <= entry or sl >= entry:
-            continue
-
-        end_idx = min(total_bars - 1, si + int(horizon))
-        future = df.iloc[si + 1 : end_idx + 1]
-
-        # Entry fill: must touch entry price (limit/stop style)
-        fill_mask = (future["low"] <= entry) & (future["high"] >= entry)
-        if not fill_mask.any():
-            canceled_count += 1
-            continue
-
-        fill_pos = int(np.argmax(fill_mask.to_numpy()))
-        fill_i = int(future.index[fill_pos])
-
-        # After fill: resolve TP/SL using pessimistic intrabar rule
-        resolved = False
-        for j in range(fill_i, end_idx + 1):
-            hi = float(df["high"].iloc[j])
-            lo = float(df["low"].iloc[j])
-            hit_tp = hi >= tp
-            hit_sl = lo <= sl
-
-            if hit_tp and hit_sl:
-                loss_count += 1
-                resolved = True
-                break
-            if hit_sl:
-                loss_count += 1
-                resolved = True
-                break
-            if hit_tp:
-                win_count += 1
-                resolved = True
-                break
-
-        if resolved:
-            continue
-
-        # Time stop: decide by PnL sign at close of horizon candle
-        close_n = float(df["close"].iloc[end_idx])
-        if close_n > entry:
-            win_count += 1
-        elif close_n < entry:
-            loss_count += 1
-        else:
-            breakeven_count += 1
-
-    denom = max((win_count + loss_count + breakeven_count), 1)
-    win_rate = float(win_count) / float(denom) * 100.0
-
-    return {
-        "total_bars": total_bars,
-        "signal_count": signal_count,
-        "win_count": int(win_count),
-        "loss_count": int(loss_count),
-        "breakeven_count": int(breakeven_count),
-        "canceled_count": int(canceled_count),
-        "win_rate": float(win_rate),
-        "start": start,
-        "end": end,
-    }
-
 
 def _strategy_signal_series(
     df: pd.DataFrame,
@@ -1607,11 +1490,14 @@ def fetch_ohlcv_twelvedata(symbol: str, api_key: str, interval: str) -> pd.DataF
     _fetch_days = {"15min": 300, "1h": 600, "4h": 1200, "1day": 2000}.get(interval, 365)
     end = datetime.utcnow()
     start = end - timedelta(days=_fetch_days)
+    
+    # We remove 'end_date' to let the API default to "now" (latest available).
+    # This prevents timezone conflicts where 'now' in UTC might be interpreted
+    # as 'past' in Bangkok time, cutting off recent data.
     params = {
         "symbol": symbol,
         "interval": interval,
         "start_date": start.strftime("%Y-%m-%d %H:%M:%S"),
-        "end_date": end.strftime("%Y-%m-%d %H:%M:%S"),
         "outputsize": 5000,
         "format": "JSON",
         "timezone": "Asia/Bangkok",
@@ -2578,6 +2464,8 @@ def render_top_stats(df: pd.DataFrame, ticker: str, interval: str) -> None:
 def main() -> None:
     if "sidebar_mini" not in st.session_state:
         st.session_state["sidebar_mini"] = False
+    st.sidebar.markdown("---")
+    st.sidebar.caption("Zenith Analysis v1.1.1 | © 2026")
     if "interval_sel" not in st.session_state:
         st.session_state["interval_sel"] = INTERVAL_OPTIONS[0]
     if "ticker_sel" not in st.session_state:
