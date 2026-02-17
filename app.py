@@ -2115,7 +2115,6 @@ def make_figure(
         rows=3,
         cols=1,
         shared_xaxes=True,
-        shared_xaxes=True,
         vertical_spacing=0.02, # Reduced gap
         row_heights=[0.7, 0.15, 0.15], # Taller Price Chart (70%)
         subplot_titles=(
