@@ -2486,11 +2486,20 @@ def main() -> None:
     st.sidebar.markdown("---")
     st.sidebar.caption("Zenith Analysis v1.1.1.1 | © 2026")
     
-    # ... (rest of sidebar code)
+    # Initialize df to avoid UnboundLocalError
+    df = pd.DataFrame()
 
-    # --- Main Content ---
+    # ... (rest of main)
+    
+    # Data Fetching Logic (Simplified for context)
+    # if st.sidebar.button("Analyze"):
+    #     df = fetch_ohlcv_twelvedata(...)
+    
+    # ...
+    
+    # CRITICAL FIX: Only run this logic if df is valid and has data
     if not df.empty:
-        # Calculate dynamic rangebreaks to hide gaps > 1 interval
+        # Calculate dynamic rangebreaks...
         # This makes the chart continuous like TradingView
         dt_diffs = df["timestamp"].diff().dt.total_seconds().dropna()
         if not dt_diffs.empty:
