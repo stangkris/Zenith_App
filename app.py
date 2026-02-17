@@ -2316,14 +2316,13 @@ def make_figure(
         title_font=dict(color="#334155", size=13),
         tickformat=".2f",
         zeroline=False,
-        showspikes=True,
         spikesnap="cursor",
         spikemode="toaxis+across",
         spikecolor="#334155",
         spikethickness=1,
         hoverformat=".2f",
         # Optimize Y-axis spikes
-        showspikes=False, 
+        showspikes=False,
     )
     fig.update_yaxes(
         title_text="Volume",
