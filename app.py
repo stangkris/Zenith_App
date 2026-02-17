@@ -2519,12 +2519,13 @@ def main() -> None:
 
     # ...
 
-    # Update chart height
-    st.plotly_chart(fig, use_container_width=True, height=760)
+        # ... (inside if not df.empty)
+        # Display the chart only if we have data and a figure
+        st.plotly_chart(fig, use_container_width=True, height=760)
 
-    # Version Label at Bottom
+    # Version Label at Bottom (Reverted to v1.1.1)
     st.sidebar.markdown("---")
-    st.sidebar.caption("Zenith Analysis v1.1.1.1 | © 2026")
+    st.sidebar.caption("Zenith Analysis v1.1.1 | © 2026")
     
     if "interval_sel" not in st.session_state:
         st.session_state["interval_sel"] = INTERVAL_OPTIONS[0]
