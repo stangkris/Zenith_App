@@ -2483,8 +2483,7 @@ def main() -> None:
     # ... (rest of sidebar code)
 
     # Move version to bottom
-    st.sidebar.markdown("---")
-    st.sidebar.caption("Zenith Analysis v1.1.1.1 | © 2026")
+    # Version removed to avoid duplication
     
     # Initialize df to avoid UnboundLocalError
     df = pd.DataFrame()
@@ -2524,8 +2523,7 @@ def main() -> None:
         st.plotly_chart(fig, use_container_width=True, height=760)
 
     # Version Label at Bottom (Reverted to v1.1.1)
-    st.sidebar.markdown("---")
-    st.sidebar.caption("Zenith Analysis v1.1.1 | © 2026")
+    # Version removed to avoid duplication
     
     if "interval_sel" not in st.session_state:
         st.session_state["interval_sel"] = INTERVAL_OPTIONS[0]
@@ -2728,7 +2726,7 @@ def main() -> None:
             )
             st.markdown(
                 "<div class='side-footer'>"
-                "Version <b>V1.1.0</b>"
+                "Zenith Analysis v1.1.1.1 | © 2026"
                 "<br>Developed by: Krisanu Kinkhuntod"
                 "</div>",
                 unsafe_allow_html=True,
