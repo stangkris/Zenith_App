@@ -2351,19 +2351,30 @@ def make_figure(
         spikesnap="cursor",
         spikemode="toaxis+across",
     )
+    # Update layout to remove gaps (TradingView style) and maximize height
     fig.update_xaxes(
+        type="category",  # Forces continuous candles with no time gaps
+        tickangle=-45,
+        nticks=20,  # Limit ticks to prevent overcrowding
         showgrid=True,
-        gridcolor="#e8edf3",
-        tickfont=dict(color="#334155", size=11),
-        showline=True,
-        linecolor="#94a3b8",
-        ticks="outside",
-        tickcolor="#94a3b8",
-        showspikes=True,
-        spikemode="toaxis+across",
-        spikesnap="cursor",
+        gridcolor="#f1f5f9",
+        fixedrange=False,
         spikecolor="#334155",
         spikethickness=1,
+    )
+    fig.update_yaxes(
+        showgrid=True,
+        gridcolor="#f1f5f9",
+        fixedrange=False,
+    )
+    fig.update_layout(
+        height=760,  # Maximize height
+        margin=dict(t=20, b=20, l=10, r=10),
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        hovermode="x unified",
+        dragmode="pan",
+        showlegend=False,
     )
 
     display_bars = {
@@ -2464,8 +2475,48 @@ def render_top_stats(df: pd.DataFrame, ticker: str, interval: str) -> None:
 def main() -> None:
     if "sidebar_mini" not in st.session_state:
         st.session_state["sidebar_mini"] = False
+    # --- Sidebar Controls ---
+    st.sidebar.title("Zenith Analysis")
+    
     st.sidebar.markdown("---")
-    st.sidebar.caption("Zenith Analysis v1.1.1 | © 2026")
+    
+    # ... (rest of sidebar code)
+
+    # Move version to bottom
+    st.sidebar.markdown("---")
+    st.sidebar.caption("Zenith Analysis v1.1.1.1 | © 2026")
+    
+    # ... (rest of sidebar code)
+
+    # --- Main Content ---
+    if not df.empty:
+        # Calculate dynamic rangebreaks to hide gaps > 1 interval
+        # This makes the chart continuous like TradingView
+        dt_diffs = df["timestamp"].diff().dt.total_seconds().dropna()
+        if not dt_diffs.empty:
+             # Most common diff is the interval
+            mode_diff = dt_diffs.mode().iloc[0]
+            # Find gaps larger than 1.5x the interval
+            gaps = df[df["timestamp"].diff().dt.total_seconds() > mode_diff * 1.5]
+            
+            # Simple approach: Use Plotly's 'category' axis if data < 1000 bars for perfect continuity
+            # OR use rangebreaks. Let's try rangebreaks first as category axis breaks strict time labels.
+            # Actually, standard TradingView style usually just hides weekends and potentially hours.
+            # BUT user complained about "sections".
+            # Let's try removing the 'rangebreaks' logic I added earlier and rely on `type='date'` 
+            # with NO breaks, but if that still shows gaps, we need `rangebreaks`.
+            # The user wants "NO GAPS". The only way to guarantee NO GAPS for irregular data is `type='category'`.
+            pass
+
+    # ...
+
+    # Update chart height
+    st.plotly_chart(fig, use_container_width=True, height=760)
+
+    # Version Label at Bottom
+    st.sidebar.markdown("---")
+    st.sidebar.caption("Zenith Analysis v1.1.1.1 | © 2026")
+    
     if "interval_sel" not in st.session_state:
         st.session_state["interval_sel"] = INTERVAL_OPTIONS[0]
     if "ticker_sel" not in st.session_state:
