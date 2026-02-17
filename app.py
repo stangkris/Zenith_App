@@ -2080,6 +2080,20 @@ def make_figure(
     chart_revision: int,
 ) -> go.Figure:
     plot_time = to_plot_timestamps(df["timestamp"], market_mode)
+    
+    # Pre-format dates for cleaner X-axis (removes 00:00:00.000000)
+    plot_time_str = []
+    if interval in ("4h", "1day"):
+        fmt = "%d %b %Y"
+    else:
+        fmt = "%d %b %H:%M"
+        
+    for ts in plot_time:
+        try:
+            plot_time_str.append(ts.strftime(fmt))
+        except:
+            plot_time_str.append(str(ts))
+            
     candle_hover = [
         (
             f"Date: {ts:%d %b %Y %H:%M}<br>"
@@ -2101,18 +2115,19 @@ def make_figure(
         rows=3,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.034,
-        row_heights=[0.63, 0.16, 0.21],
+        shared_xaxes=True,
+        vertical_spacing=0.02, # Reduced gap
+        row_heights=[0.7, 0.15, 0.15], # Taller Price Chart (70%)
         subplot_titles=(
             "MAIN CHART (OHLC + STRATEGY ZONES)",
-            "VOLUME (GREEN = UP BAR, RED = DOWN BAR)",
-            "RSI (14) (GREEN/RED = MOMENTUM)",
+            "VOLUME",
+            "RSI (14)",
         ),
     )
 
     fig.add_trace(
         go.Candlestick(
-            x=plot_time,
+            x=plot_time_str, # Use formatted strings
             open=df["open"],
             high=df["high"],
             low=df["low"],
@@ -2139,7 +2154,7 @@ def make_figure(
 
     fig.add_trace(
         go.Bar(
-            x=plot_time,
+            x=plot_time_str,
             y=df["volume"],
             marker_color=vol_colors,
             name="Volume",
@@ -2157,7 +2172,7 @@ def make_figure(
         ).tolist()
         fig.add_trace(
             go.Bar(
-                x=plot_time,
+                x=plot_time_str,
                 y=df["rsi14"],
                 marker_color=rsi_colors,
                 name="RSI Momentum",
@@ -2170,7 +2185,7 @@ def make_figure(
         )
         fig.add_trace(
             go.Scatter(
-                x=plot_time,
+                x=plot_time_str,
                 y=df["rsi14"],
                 name="RSI(14)",
                 line=dict(color="#0f172a", width=1.0),
@@ -2183,7 +2198,7 @@ def make_figure(
     else:
         fig.add_trace(
             go.Scatter(
-                x=plot_time,
+                x=plot_time_str,
                 y=df["rsi14"],
                 name="RSI(14)",
                 line=dict(color="#334155", width=1.9),
@@ -2208,32 +2223,43 @@ def make_figure(
         "4h": 12,
         "1day": 8,
     }.get(interval, 12)
-    future_x = plot_time.iloc[-1] + (inferred_step * projection_bars)
-
+    # Future projection logic for Category Axis (Strings) is tricky.
+    # We will just use index-based placement or skip projection for cleanliness if needed.
+    # For now, let's keep it simple: No empty future bars to avoid category issues.
+    # If users really need it, we must append empty strings to plot_time_str.
+    pass # Removed projection for robustness with category axis
+    
     if selected_strategy == "SMC (BOS/OB/FVG)":
         for zone in analysis.get("fvg_zones", [])[-4:]:
-            x0 = plot_time.iloc[zone["start_index"]]
-            fig.add_shape(
-                type="rect", xref="x", yref="y", x0=x0, x1=future_x, y0=zone["low"], y1=zone["high"],
-                fillcolor="rgba(147, 197, 253, 0.25)", line=dict(color="rgba(59,130,246,0.38)", width=1), row=1, col=1,
-            )
+            # Use Index for X-coordinates on Category Axis
+            x0_idx = zone["start_index"]
+            if x0_idx < len(plot_time_str):
+                x0 = plot_time_str[x0_idx]
+                # Draw shape extending to right edge (approx)
+                fig.add_shape(
+                    type="rect", xref="x", yref="y", x0=x0, x1=plot_time_str[-1], y0=zone["low"], y1=zone["high"],
+                    fillcolor="rgba(147, 197, 253, 0.25)", line=dict(color="rgba(59,130,246,0.38)", width=1), row=1, col=1,
+                )
         for zone in analysis.get("ob_zones", [])[-4:]:
-            x0 = plot_time.iloc[zone["index"]]
-            fig.add_shape(
-                type="rect", xref="x", yref="y", x0=x0, x1=future_x, y0=zone["low"], y1=zone["high"],
-                fillcolor="rgba(110, 231, 183, 0.28)", line=dict(color="rgba(16,185,129,0.42)", width=1), row=1, col=1,
-            )
+            x0_idx = zone["index"]
+            if x0_idx < len(plot_time_str):
+                x0 = plot_time_str[x0_idx]
+                fig.add_shape(
+                    type="rect", xref="x", yref="y", x0=x0, x1=plot_time_str[-1], y0=zone["low"], y1=zone["high"],
+                    fillcolor="rgba(110, 231, 183, 0.28)", line=dict(color="rgba(16,185,129,0.42)", width=1), row=1, col=1,
+                )
         for bos in analysis.get("bos_events", [])[-8:]:
             idx = bos["index"]
-            fig.add_annotation(
-                x=plot_time.iloc[idx], y=df["high"].iloc[idx], text="BOS", showarrow=True, arrowhead=2,
-                font=dict(color="#1e3a8a", size=10), bgcolor="rgba(255,255,255,0.75)", bordercolor="rgba(147,197,253,0.7)",
-                row=1, col=1,
-            )
+            if idx < len(plot_time_str):
+                fig.add_annotation(
+                    x=plot_time_str[idx], y=df["high"].iloc[idx], text="BOS", showarrow=True, arrowhead=2,
+                    font=dict(color="#1e3a8a", size=10), bgcolor="rgba(255,255,255,0.75)", bordercolor="rgba(147,197,253,0.7)",
+                    row=1, col=1,
+                )
 
     if selected_strategy == "Momentum Breakout (EMA50 + VCP)":
         fig.add_trace(
-            go.Scatter(x=plot_time, y=df["ema50"], mode="lines", line=dict(color="#2563eb", width=1.9), name="EMA 50"),
+            go.Scatter(x=plot_time_str, y=df["ema50"], mode="lines", line=dict(color="#2563eb", width=1.9), name="EMA 50"),
             row=1,
             col=1,
         )
@@ -2250,27 +2276,30 @@ def make_figure(
 
     if selected_strategy == "Pullback Reversal (EMA200 + Fib + RSI)":
         fig.add_trace(
-            go.Scatter(x=plot_time, y=df["ema200"], mode="lines", line=dict(color="#0f766e", width=2.0), name="EMA 200"),
-            row=1,
-            col=1,
+            go.Scatter(x=plot_time_str, y=df["ema200"], mode="lines", line=dict(color="#0f766e", width=2.0), name="EMA 200"),
         )
         fib = analysis["fib"]
         fib50, fib618 = fib["50"], fib["61_8"]
         _add_hline(fig, y=fib50, line_color="#f59e0b", line_dash="dot", annotation_text="Fib 50%", row=1, col=1)
         _add_hline(fig, y=fib618, line_color="#a78bfa", line_dash="dot", annotation_text="Fib 61.8%", row=1, col=1)
-        fig.add_shape(
-            type="rect",
-            xref="x",
-            yref="y",
-            x0=plot_time.iloc[max(fib["low_idx"], 0)],
-            x1=future_x,
-            y0=min(fib50, fib618),
-            y1=max(fib50, fib618),
-            fillcolor="rgba(254, 243, 199, 0.45)",
-            line=dict(color="rgba(245,158,11,0.35)", width=1),
-            row=1,
-            col=1,
-        )
+        
+        # Fib Zone
+        low_idx = fib.get("low_idx", 0)
+        if 0 <= low_idx < len(plot_time_str):
+            x0 = plot_time_str[low_idx]
+            fig.add_shape(
+                type="rect",
+                xref="x",
+                yref="y",
+                x0=x0,
+                x1=plot_time_str[-1],
+                y0=min(fib50, fib618),
+                y1=max(fib50, fib618),
+                fillcolor="rgba(254, 243, 199, 0.45)",
+                line=dict(color="rgba(245,158,11,0.35)", width=1),
+                row=1,
+                col=1,
+            )
 
     if selected_strategy == "Volume Profile (POC)":
         _add_hline(
@@ -2371,8 +2400,8 @@ def make_figure(
         fixedrange=False,
     )
     fig.update_layout(
-        height=760,  # Maximize height
-        margin=dict(t=20, b=20, l=10, r=10),
+        height=800,  # Increased overall height
+        margin=dict(t=20, b=10, l=10, r=10),
         paper_bgcolor="#ffffff",
         plot_bgcolor="#ffffff",
         hovermode="x unified",
@@ -2380,33 +2409,14 @@ def make_figure(
         showlegend=False,
     )
 
-    display_bars = {
-        "15min": 760,
-        "1h": 640,
-        "4h": 320,
-        "1day": 220,
-    }.get(interval, len(df))
-    start_idx = 0 # Default to full view (Overview mode)
-    x_start = plot_time.iloc[start_idx]
-
-    right_pad = max(inferred_step * 2, pd.Timedelta(hours=2))
-    x_end = plot_time.iloc[-1] + right_pad
-    if future_x > x_end:
-        x_end = future_x
-
-    range_breaks = build_xaxis_rangebreaks(interval, market_mode)
-    if interval in {"15min", "1h", "4h"}:
+    # Remove dynamic range breaks and rely on Category Axis
+    # This ensures "No Gaps" for weekends/holidays naturally.
+    if len(plot_time_str) > 0:
         fig.update_xaxes(
-            rangebreaks=range_breaks,
-            tickformat="%d %b %H:%M" if interval not in ("4h", "1day") else "%d %b %Y",
+             # Use the first and last formatted string to set the range
+            range=[plot_time_str[0], plot_time_str[-1]],
+            type="category" # Enforce category to respect the string list
         )
-    else:
-        fig.update_xaxes(
-            rangebreaks=range_breaks,
-            tickformat="%d %b %Y",
-        )
-
-    fig.update_xaxes(range=[x_start, x_end])
 
     vol_ceiling = float(df["volume"].quantile(0.97))
     if vol_ceiling > 0:
