@@ -234,6 +234,7 @@ def analyze_smc(df: pd.DataFrame) -> dict:
         "entry": round(entry, 4),
         "sl": round(sl, 4),
         "tp": round(tp, 4),
+        "order_type": "limit",
         "fvg_zones": fvg_zones,
         "ob_zones": ob_zones,
         "bos_events": bos_events,
@@ -243,8 +244,14 @@ def analyze_smc(df: pd.DataFrame) -> dict:
     }
 
 
-def _recent_resistance(df: pd.DataFrame, length: int = 20) -> float:
-    window = df.tail(length)
+def _recent_resistance(df: pd.DataFrame, length: int = 20, include_current: bool = False) -> float:
+    if df.empty:
+        return 0.0
+
+    scope = df if include_current else df.iloc[:-1]
+    if scope.empty:
+        scope = df
+    window = scope.tail(length)
     return float(window["high"].max())
 
 
@@ -263,21 +270,22 @@ def _is_tight_consolidation(df: pd.DataFrame, length: int = 10) -> bool:
         float(window["high"].iloc[-4:].max() - window["low"].iloc[-4:].min()),
     ]
     contracting = swings[2] <= swings[1] <= swings[0]
-    contracting = swings[2] <= swings[1] <= swings[0]
     # Relaxed from 0.06 to 0.15 (15%) to catch more setups
     return width < 0.15 and contracting
 
 
 def analyze_momentum_breakout(df: pd.DataFrame) -> dict:
-    resistance = _recent_resistance(df, 20)
+    resistance = _recent_resistance(df, 20, include_current=False)
     last_close = float(df["close"].iloc[-1])
+    prev_close = float(df["close"].iloc[-2]) if len(df) > 1 else last_close
     last_ema50 = float(df["ema50"].iloc[-1])
     avg_volume = float(df["vol_sma20"].iloc[-1])
     last_volume = float(df["volume"].iloc[-1])
 
+    base_window = df.iloc[:-1] if len(df) > 11 else df
     trend_pass = last_close > last_ema50
-    zone_pass = _is_tight_consolidation(df, 10) and abs(last_close - resistance) / max(resistance, 1e-9) < 0.03
-    trigger_pass = last_close > resistance and last_volume > 2 * avg_volume
+    zone_pass = _is_tight_consolidation(base_window, 10) and abs(last_close - resistance) / max(resistance, 1e-9) < 0.03
+    trigger_pass = prev_close <= resistance and last_close > resistance and last_volume > 2 * avg_volume
 
     breakout_idx = len(df) - 1 if trigger_pass else None
 
@@ -308,6 +316,7 @@ def analyze_momentum_breakout(df: pd.DataFrame) -> dict:
         "entry": round(entry, 4),
         "sl": round(sl, 4),
         "tp": round(tp, 4),
+        "order_type": "stop",
         "resistance": resistance,
         "breakout_idx": breakout_idx,
         "volume_spike": last_volume > 2 * avg_volume,
@@ -317,10 +326,17 @@ def analyze_momentum_breakout(df: pd.DataFrame) -> dict:
 def _major_swing_low_high(df: pd.DataFrame, lookback: int = 90) -> tuple[int, int]:
     window = df.tail(lookback)
     start_idx = len(df) - len(window)
+    if window.empty:
+        return 0, 0
 
-    local_low_idx = int(window["low"].idxmin())
-    after_low = df.loc[local_low_idx:]
-    local_high_idx = int(after_low["high"].idxmax())
+    low_pos = int(np.argmin(window["low"].to_numpy()))
+    local_low_idx = start_idx + low_pos
+    after_low = df.iloc[local_low_idx:]
+    if after_low.empty:
+        return max(local_low_idx, 0), max(local_low_idx, 0)
+
+    high_pos = int(np.argmax(after_low["high"].to_numpy()))
+    local_high_idx = local_low_idx + high_pos
 
     if local_high_idx <= local_low_idx:
         local_low_idx = start_idx
@@ -395,6 +411,7 @@ def analyze_pullback_reversal(df: pd.DataFrame) -> dict:
         "entry": round(entry, 4),
         "sl": round(sl, 4),
         "tp": round(tp, 4),
+        "order_type": "market",
         "fib": fib,
         "rsi": rsi,
         "bullish_divergence": _bullish_divergence(df),
@@ -406,8 +423,6 @@ def volume_profile_poc(df: pd.DataFrame, bins: int = 24) -> dict:
     price_max = float(df["high"].max())
     edges = np.linspace(price_min, price_max, bins + 1)
     typical_price = (df["high"] + df["low"] + df["close"]) / 3
-    hist, edges = np.histogram(typical_price, bins=edges, weights=df["volume"])
-
     hist, edges = np.histogram(typical_price, bins=edges, weights=df["volume"])
 
     # Basic POC
@@ -492,6 +507,7 @@ def analyze_volume_profile(df: pd.DataFrame) -> dict:
         "entry": round(entry, 4),
         "sl": round(sl, 4),
         "tp": round(tp, 4),
+        "order_type": "limit",
         "poc": round(poc, 4),
         "volume_profile": vp,
     }

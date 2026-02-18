@@ -1,6 +1,7 @@
 ﻿import os
 import re
 import html
+import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -51,7 +52,7 @@ STRATEGY_OPTIONS = [
 INTERVAL_OPTIONS = ["15min", "1h", "4h", "1day"]
 FIGURE_SCHEMA_VERSION = 5
 BACKTEST_CACHE_FILE = Path(__file__).with_name("backtest_trades.csv")
-BACKTEST_SCHEMA_VERSION = 2
+BACKTEST_SCHEMA_VERSION = 3
 BACKTEST_DEFAULT_REFRESH_DAYS = 1
 BACKTEST_MAX_BARS = {
     "15min": 5000,
@@ -74,6 +75,49 @@ BACKTEST_STRATEGY_LOOKBACK = {
 }
 
 
+def _backtest_signal_bounds(total_bars: int, interval: str) -> tuple[int | None, int | None, int]:
+    if total_bars <= 0 or total_bars < BACKTEST_MIN_WARMUP:
+        return None, None, 0
+
+    horizon = int(BACKTEST_HORIZON_BARS.get(interval, 12))
+    max_bars = int(BACKTEST_MAX_BARS.get(interval, 600))
+    analysis_start = max(0, total_bars - max_bars)
+    work_start = max(0, analysis_start - BACKTEST_MIN_WARMUP)
+
+    local_loop_start = analysis_start - work_start
+    local_latest_signal = (total_bars - work_start) - horizon - 1
+    if local_latest_signal < local_loop_start:
+        return None, None, work_start
+
+    global_start = work_start + local_loop_start
+    global_end = work_start + local_latest_signal
+    return global_start, global_end, work_start
+
+
+def _compute_source_digest(df: pd.DataFrame) -> str:
+    if df.empty:
+        return ""
+
+    needed = ["timestamp", "open", "high", "low", "close", "volume"]
+    cols = [c for c in needed if c in df.columns]
+    if not cols:
+        return ""
+
+    payload = df[cols].copy()
+    if "timestamp" in payload.columns:
+        ts = pd.to_datetime(payload["timestamp"], errors="coerce")
+        payload["timestamp"] = ts.dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col in payload.columns:
+            payload[col] = pd.to_numeric(payload[col], errors="coerce").round(8)
+
+    if "timestamp" in payload.columns:
+        payload = payload.sort_values("timestamp")
+    raw = payload.to_csv(index=False).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
 
 def _strategy_signal_series(
     df: pd.DataFrame,
@@ -83,30 +127,22 @@ def _strategy_signal_series(
 ) -> pd.Series:
     n = len(df)
     signals = pd.Series(False, index=df.index)
-    if n < BACKTEST_MIN_WARMUP:
+    loop_start_global, loop_end_global, work_start = _backtest_signal_bounds(n, interval)
+    if loop_start_global is None or loop_end_global is None:
         return signals
 
-    horizon = BACKTEST_HORIZON_BARS.get(interval, 12)
-    max_bars = BACKTEST_MAX_BARS.get(interval, 600)
-
-    start_idx = max(0, n - max_bars)
-    start_idx = max(0, start_idx - BACKTEST_MIN_WARMUP)
-    work = df.iloc[start_idx:].reset_index(drop=True)
-
-    loop_start = BACKTEST_MIN_WARMUP
-    loop_end = len(work) - horizon - 1
-    if loop_end <= loop_start:
-        return signals
-
-    total = int(loop_end - loop_start)
+    work = df.iloc[work_start:].reset_index(drop=True)
+    loop_start = int(loop_start_global - work_start)
+    loop_end = int(loop_end_global - work_start)
+    total = int(loop_end - loop_start + 1)
     lookback = int(BACKTEST_STRATEGY_LOOKBACK.get(interval, 800))
 
-    for step, i in enumerate(range(loop_start, loop_end), start=1):
+    for step, i in enumerate(range(loop_start, loop_end + 1), start=1):
         sub_start = max(0, i + 1 - lookback)
         sub = work.iloc[sub_start : i + 1]
         try:
             res = run_strategy(sub, strategy_name)
-            global_i = start_idx + i
+            global_i = work_start + i
             signals.iloc[global_i] = bool(res.get("status") == "BUY")
         except Exception:
             pass
@@ -130,7 +166,8 @@ def _load_backtest_cache() -> pd.DataFrame:
     if "schema_version" not in cached.columns:
         return pd.DataFrame()
     try:
-        if int(cached["schema_version"].iloc[0]) != BACKTEST_SCHEMA_VERSION:
+        versions = pd.to_numeric(cached["schema_version"], errors="coerce").dropna().astype(int).unique().tolist()
+        if not versions or any(v != BACKTEST_SCHEMA_VERSION for v in versions):
             return pd.DataFrame()
     except Exception:
         return pd.DataFrame()
@@ -147,9 +184,11 @@ def _load_backtest_cache() -> pd.DataFrame:
         "sl",
         "tp",
         "r_result",
+        "order_type",
         "exit_reason",
         "data_start",
         "data_end",
+        "data_digest",
     ]:
         if col not in cached.columns:
             cached[col] = np.nan
@@ -241,6 +280,14 @@ def _compute_advanced_metrics(trades: pd.DataFrame) -> dict:
             "trades_per_month": 0.0,
         }
 
+    sort_cols: list[str] = []
+    if "exit_time" in filled.columns:
+        sort_cols.append("exit_time")
+    if "entry_time" in filled.columns:
+        sort_cols.append("entry_time")
+    if sort_cols:
+        filled = filled.sort_values(sort_cols, na_position="last").reset_index(drop=True)
+
     r = filled["r_result"]
     wins = r[r > 0]
     losses = r[r < 0]
@@ -262,7 +309,7 @@ def _compute_advanced_metrics(trades: pd.DataFrame) -> dict:
     loss_rate_dec = float(loss_count) / max(trade_count, 1)
     expectancy = (win_rate_dec * avg_win_r) - (loss_rate_dec * avg_loss_r)
 
-    equity, mdd = _calculate_equity_curve_and_mdd(r.tolist())
+    _, mdd = _calculate_equity_curve_and_mdd(r.tolist())
 
     # Trade frequency per month based on exit_time
     filled = filled.dropna(subset=["exit_time"])
@@ -321,7 +368,7 @@ def _simulate_trades_from_signals(
                 break
             continue
 
-        if si >= len(df) - 3:
+        if si >= len(df) - 2:
             if not emit_progress(step):
                 break
             continue
@@ -337,6 +384,16 @@ def _simulate_trades_from_signals(
         raw_entry = float(levels.get("entry", np.nan))
         raw_sl = float(levels.get("sl", np.nan))
         raw_tp = float(levels.get("tp", np.nan))
+        signal_close = float(df["close"].iloc[si])
+        order_type = str(levels.get("order_type", "")).strip().lower()
+        if order_type not in {"limit", "stop", "market"}:
+            tol = max(abs(signal_close) * 0.0005, 1e-6)
+            if abs(raw_entry - signal_close) <= tol:
+                order_type = "market"
+            elif raw_entry > signal_close:
+                order_type = "stop"
+            else:
+                order_type = "limit"
 
         if not (np.isfinite(raw_entry) and np.isfinite(raw_sl) and np.isfinite(raw_tp)):
             if not emit_progress(step):
@@ -346,21 +403,60 @@ def _simulate_trades_from_signals(
             if not emit_progress(step):
                 break
             continue
-            
-        # Apply Slippage to Entry (Buy higher)
-        entry = raw_entry * (1 + SLIPPAGE_PCT)
-        sl = raw_sl  # SL trigger remains same, but execution might slip
-        tp = raw_tp
 
         end_idx = min(len(df) - 1, si + horizon)
         future = df.iloc[si + 1 : end_idx + 1]
-        fill_mask = (future["low"] <= entry) & (future["high"] >= entry)
-        if not fill_mask.any():
+        fill_i: int | None = None
+        fill_price_base: float | None = None
+
+        if order_type == "market":
+            if si + 1 <= end_idx:
+                fill_i = si + 1
+                fill_price_base = float(df["open"].iloc[fill_i])
+        elif not future.empty:
+            if order_type == "limit":
+                fill_mask = future["low"] <= raw_entry
+                if fill_mask.any():
+                    fill_pos = int(np.argmax(fill_mask.to_numpy()))
+                    fill_i = int(future.index[fill_pos])
+                    fill_price_base = raw_entry
+            else:  # stop
+                fill_mask = future["high"] >= raw_entry
+                if fill_mask.any():
+                    fill_pos = int(np.argmax(fill_mask.to_numpy()))
+                    fill_i = int(future.index[fill_pos])
+                    fill_price_base = max(raw_entry, float(df["open"].iloc[fill_i]))
+
+        if fill_i is None or fill_price_base is None:
             rows.append(
                 {
                     "entry_idx": si,
                     "exit_idx": np.nan,
                     "entry_time": df["timestamp"].iloc[si],
+                    "exit_time": pd.NaT,
+                    "entry": raw_entry,
+                    "exit": np.nan,
+                    "sl": raw_sl,
+                    "tp": raw_tp,
+                    "r_result": np.nan,
+                    "exit_reason": "CANCELED",
+                    "order_type": order_type,
+                }
+            )
+            if not emit_progress(step):
+                break
+            continue
+
+        # Apply slippage after order is considered filled.
+        entry = float(fill_price_base) * (1 + SLIPPAGE_PCT)
+        sl = raw_sl
+        tp = raw_tp
+        if tp <= entry or sl >= entry:
+            rows.append(
+                {
+                    "entry_idx": fill_i,
+                    "exit_idx": np.nan,
+                    "entry_time": df["timestamp"].iloc[fill_i],
                     "exit_time": pd.NaT,
                     "entry": entry,
                     "exit": np.nan,
@@ -368,14 +464,12 @@ def _simulate_trades_from_signals(
                     "tp": tp,
                     "r_result": np.nan,
                     "exit_reason": "CANCELED",
+                    "order_type": order_type,
                 }
             )
             if not emit_progress(step):
                 break
             continue
-
-        fill_pos = int(np.argmax(fill_mask.to_numpy()))
-        fill_i = int(future.index[fill_pos])
 
         exit_idx: int | None = None
         exit_price: float | None = None
@@ -419,12 +513,8 @@ def _simulate_trades_from_signals(
         final_exit_price = exit_price * (1 - SLIPPAGE_PCT)
 
         risk = max(entry - sl, 1e-9)
-        # Commission is calculated based on total position value (entry + exit), usually 0.1% roundtrip approximation
-        # Cost in R terms = (Commission_Amt / Risk_Amt)
-        # Approx cost = 0.1% of Entry Price
-        # Precise R calc:
         gross_pnl = final_exit_price - entry
-        commission_cost = entry * COMMISSION_PCT
+        commission_cost = (entry + final_exit_price) * (COMMISSION_PCT / 2.0)
         net_pnl = gross_pnl - commission_cost
         r_result = net_pnl / risk
 
@@ -440,6 +530,7 @@ def _simulate_trades_from_signals(
                 "tp": float(tp),
                 "r_result": float(r_result),
                 "exit_reason": str(exit_reason),
+                "order_type": order_type,
             }
         )
 
@@ -462,6 +553,8 @@ def _canonicalize_trade_log(df: pd.DataFrame) -> pd.DataFrame:
             out[col] = pd.to_numeric(out[col], errors="coerce")
     exit_reason_col = out["exit_reason"] if "exit_reason" in out.columns else pd.Series("", index=out.index)
     out["exit_reason"] = exit_reason_col.astype(str)
+    order_type_col = out["order_type"] if "order_type" in out.columns else pd.Series("limit", index=out.index)
+    out["order_type"] = order_type_col.astype(str).str.lower().replace({"": "limit", "nan": "limit"})
     return out
 
 
@@ -485,6 +578,7 @@ def _append_and_dedup_trades(existing: pd.DataFrame, new: pd.DataFrame) -> pd.Da
         "entry",
         "sl",
         "tp",
+        "order_type",
     ]
     subset = [c for c in subset if c in combined.columns]
     if not subset:
@@ -518,6 +612,7 @@ def _get_backtest_summary(
     total_bars = int(len(df))
     source_start = pd.to_datetime(df["timestamp"].iloc[0], errors="coerce") if total_bars else pd.NaT
     source_end = pd.to_datetime(df["timestamp"].iloc[-1], errors="coerce") if total_bars else pd.NaT
+    source_digest = _compute_source_digest(df)
 
     if cached.empty:
         key_mask = pd.Series(False, index=cached.index, dtype=bool)
@@ -541,6 +636,7 @@ def _get_backtest_summary(
     meta_rows = cached[meta_mask].copy() if not cached.empty else pd.DataFrame()
     last_refresh: pd.Timestamp | None = None
     cached_data_end: pd.Timestamp | None = None
+    cached_data_digest = ""
     if not meta_rows.empty:
         try:
             last_refresh = pd.to_datetime(meta_rows["exit_time"].iloc[-1], errors="coerce")
@@ -551,6 +647,11 @@ def _get_backtest_summary(
                 cached_data_end = pd.to_datetime(meta_rows["data_end"].iloc[-1], errors="coerce")
             except Exception:
                 cached_data_end = None
+        if "data_digest" in meta_rows.columns:
+            try:
+                cached_data_digest = str(meta_rows["data_digest"].iloc[-1] or "").strip()
+            except Exception:
+                cached_data_digest = ""
 
     # Split meta and trades
     if not key_rows.empty and "exit_reason" in key_rows.columns:
@@ -567,6 +668,7 @@ def _get_backtest_summary(
         except Exception:
             cached_data_start = None
 
+    force_full_recalc = False
     if cached_data_end is not None and not pd.isna(cached_data_end) and not pd.isna(source_end):
         end_ok = bool(source_end <= cached_data_end)
         # Also invalidate if the new source starts earlier than what was cached
@@ -578,6 +680,13 @@ def _get_backtest_summary(
         cache_hit = end_ok and start_ok
     else:
         cache_hit = bool((not trades.empty) and (not _should_refresh_backtest_cache(last_refresh)))
+
+    if not cached_data_digest:
+        cache_hit = False
+        force_full_recalc = True
+    elif source_digest and cached_data_digest != source_digest:
+        cache_hit = False
+        force_full_recalc = True
 
     def run_backtest_window(df_window: pd.DataFrame) -> tuple[pd.Series, pd.DataFrame]:
         sig = _strategy_signal_series(
@@ -608,7 +717,10 @@ def _get_backtest_summary(
         if anchor_ts is None or pd.isna(anchor_ts):
             anchor_ts = _get_last_exit_time(trades)
 
-        if trades.empty or anchor_ts is None or pd.isna(anchor_ts):
+        if force_full_recalc:
+            trades = pd.DataFrame()
+            signals, new_trades = run_backtest_window(df)
+        elif trades.empty or anchor_ts is None or pd.isna(anchor_ts):
             signals, new_trades = run_backtest_window(df)
         else:
             ts_all = pd.to_datetime(df["timestamp"], errors="coerce")
@@ -652,9 +764,11 @@ def _get_backtest_summary(
                     "sl": np.nan,
                     "tp": np.nan,
                     "r_result": np.nan,
+                    "order_type": np.nan,
                     "exit_reason": "__META__",
                     "data_start": source_start,
                     "data_end": source_end,
+                    "data_digest": source_digest,
                 }
             ]
         )
@@ -670,16 +784,24 @@ def _get_backtest_summary(
     # Metrics
     metrics = _compute_advanced_metrics(trades)
 
-    start = df["timestamp"].iloc[0] if total_bars else None
-    end = df["timestamp"].iloc[-1] if total_bars else None
+    signal_start_idx, signal_end_idx, _ = _backtest_signal_bounds(total_bars, interval)
+    if signal_start_idx is not None and signal_end_idx is not None:
+        start = pd.to_datetime(df["timestamp"].iloc[signal_start_idx], errors="coerce")
+        end = pd.to_datetime(df["timestamp"].iloc[signal_end_idx], errors="coerce")
+    else:
+        start = df["timestamp"].iloc[0] if total_bars else None
+        end = df["timestamp"].iloc[-1] if total_bars else None
 
     canceled_count = int((trades["exit_reason"] == "CANCELED").sum()) if not trades.empty else 0
-
     signal_count = int(trades.shape[0])
+    filled_count = int(metrics["trade_count"])
+    fill_rate = (float(filled_count) / float(signal_count) * 100.0) if signal_count else 0.0
 
     summary = {
         "total_bars": total_bars,
         "signal_count": signal_count,
+        "filled_count": filled_count,
+        "fill_rate": fill_rate,
         "win_count": metrics["win_count"],
         "loss_count": metrics["loss_count"],
         "breakeven_count": metrics["breakeven_count"],
@@ -691,6 +813,8 @@ def _get_backtest_summary(
         "trades_per_month": metrics["trades_per_month"],
         "start": start,
         "end": end,
+        "source_start": source_start,
+        "source_end": source_end,
         "last_refresh_utc": last_refresh if cache_hit and isinstance(last_refresh, pd.Timestamp) and not pd.isna(last_refresh) else pd.Timestamp.now(tz="UTC"),
     }
 
@@ -1898,7 +2022,7 @@ def render_backtest_results_content(
         "<div style='margin-top:8px;font-size:12px;color:#64748b;line-height:1.6;'>"
         "<div style='padding:3px 0;'>\u2022 \u0e43\u0e0a\u0e49\u0e2a\u0e31\u0e0d\u0e0d\u0e32\u0e13 \u201cBUY\u201d \u0e02\u0e2d\u0e07\u0e01\u0e25\u0e22\u0e38\u0e17\u0e18\u0e4c \u0e08\u0e33\u0e25\u0e2d\u0e07\u0e04\u0e33\u0e2a\u0e31\u0e48\u0e07 Entry/SL/TP (Structure Based)</div>"
         "<div style='padding:3px 0;'>\u2022 <b>Realism</b>: Slippage 0.05% + Comm 0.1% + No Overlap</div>"
-        "<div style='padding:3px 0;'>\u2022 <b>Entry Fill</b>: \u0e23\u0e32\u0e04\u0e32\u0e15\u0e49\u0e2d\u0e07\u0e41\u0e15\u0e30 Entry \u0e01\u0e48\u0e2d\u0e19 (Limit/Stop)</div>"
+        "<div style='padding:3px 0;'>\u2022 <b>Entry Fill</b>: รองรับ Market / Limit / Stop ตามกลยุทธ์</div>"
         "<div style='padding:3px 0;'>\u2022 <b>Intrabar</b>: \u0e16\u0e49\u0e32\u0e41\u0e17\u0e48\u0e07\u0e40\u0e14\u0e35\u0e22\u0e27\u0e0a\u0e19 TP+SL \u2192 \u0e16\u0e37\u0e2d\u0e27\u0e48\u0e32\u0e41\u0e1e\u0e49</div>"
         "<div style='padding:3px 0;'>\u2022 <b>Time Stop</b>: \u0e04\u0e23\u0e1a Horizon \u2192 \u0e1b\u0e34\u0e14\u0e17\u0e35\u0e48 Close</div>"
         "<div style='padding:3px 0;'>\u2022 \u0e21\u0e35 cache \u0e40\u0e1e\u0e37\u0e48\u0e2d\u0e04\u0e33\u0e19\u0e27\u0e13\u0e40\u0e09\u0e1e\u0e32\u0e30\u0e02\u0e49\u0e2d\u0e21\u0e39\u0e25\u0e43\u0e2b\u0e21\u0e48</div>"
@@ -1917,6 +2041,8 @@ def render_backtest_results_content(
         cache_badge = "cache" if bt_cache_hit else "incremental"
 
         sig_c = int(bt_summary.get("signal_count", 0))
+        filled_c = int(bt_summary.get("filled_count", max(sig_c - int(bt_summary.get("canceled_count", 0)), 0)))
+        fill_rate = float(bt_summary.get("fill_rate", (filled_c / sig_c * 100.0) if sig_c else 0.0))
         win_c = int(bt_summary.get("win_count", 0))
         loss_c = int(bt_summary.get("loss_count", 0))
         be_c = int(bt_summary.get("breakeven_count", 0))
@@ -1953,7 +2079,7 @@ def render_backtest_results_content(
         html_parts.append(
             f"<div style='{S['metric_box']}'>"
             f"<div style='{S['metric_val']}color:{wr_color};'>{win_rate:.1f}%</div>"
-            f"<div style='{S['metric_lbl']}'>Win Rate</div>"
+            f"<div style='{S['metric_lbl']}'>Win Rate (Filled)</div>"
             f"<div style='height:3px;background:#e2e8f0;border-radius:2px;margin-top:4px;'>"
             f"<div style='height:100%;width:{min(win_rate, 100):.0f}%;background:{wr_color};"
             f"border-radius:2px;'></div></div></div>"
@@ -1979,7 +2105,9 @@ def render_backtest_results_content(
         # Detail rows card
         html_parts.append(f"<div style='{S['card']}'>")
         details = [
-            ("\u0e40\u0e2a\u0e21\u0e2d / Canceled", f"{be_c:,} / {cancel_c:,}"),
+            ("Filled / Canceled", f"{filled_c:,} / {cancel_c:,}"),
+            ("Fill Rate", f"{fill_rate:.1f}%"),
+            ("Breakeven", f"{be_c:,}"),
             ("Expectancy", f"{expectancy:.3f}"),
             ("Max Drawdown (R)", f"{max_dd:.3f}"),
             ("Trades / Month", f"{tpm:.2f}"),
@@ -2080,20 +2208,7 @@ def make_figure(
     chart_revision: int,
 ) -> go.Figure:
     plot_time = to_plot_timestamps(df["timestamp"], market_mode)
-    
-    # Pre-format dates for cleaner X-axis (removes 00:00:00.000000)
-    plot_time_str = []
-    if interval in ("4h", "1day"):
-        fmt = "%d %b %Y"
-    else:
-        fmt = "%d %b %H:%M"
-        
-    for ts in plot_time:
-        try:
-            plot_time_str.append(ts.strftime(fmt))
-        except:
-            plot_time_str.append(str(ts))
-            
+
     candle_hover = [
         (
             f"Date: {ts:%d %b %Y %H:%M}<br>"
@@ -2126,7 +2241,7 @@ def make_figure(
 
     fig.add_trace(
         go.Candlestick(
-            x=plot_time_str, # Use formatted strings
+            x=plot_time,
             open=df["open"],
             high=df["high"],
             low=df["low"],
@@ -2153,7 +2268,7 @@ def make_figure(
 
     fig.add_trace(
         go.Bar(
-            x=plot_time_str,
+            x=plot_time,
             y=df["volume"],
             marker_color=vol_colors,
             name="Volume",
@@ -2171,7 +2286,7 @@ def make_figure(
         ).tolist()
         fig.add_trace(
             go.Bar(
-                x=plot_time_str,
+                x=plot_time,
                 y=df["rsi14"],
                 marker_color=rsi_colors,
                 name="RSI Momentum",
@@ -2184,7 +2299,7 @@ def make_figure(
         )
         fig.add_trace(
             go.Scatter(
-                x=plot_time_str,
+                x=plot_time,
                 y=df["rsi14"],
                 name="RSI(14)",
                 line=dict(color="#0f172a", width=1.0),
@@ -2197,7 +2312,7 @@ def make_figure(
     else:
         fig.add_trace(
             go.Scatter(
-                x=plot_time_str,
+                x=plot_time,
                 y=df["rsi14"],
                 name="RSI(14)",
                 line=dict(color="#334155", width=1.9),
@@ -2210,55 +2325,36 @@ def make_figure(
 
     _add_hline(fig, y=70, line_dash="dash", line_color="#d1d5db", row=3, col=1)
     _add_hline(fig, y=30, line_dash="dash", line_color="#d1d5db", row=3, col=1)
-
-    ts_deltas = plot_time.diff().dropna()
-    inferred_step = pd.to_timedelta(ts_deltas.median()) if not ts_deltas.empty else pd.Timedelta(hours=1)
-    if pd.isna(inferred_step) or inferred_step <= pd.Timedelta(0):
-        inferred_step = pd.Timedelta(hours=1)
-
-    projection_bars = {
-        "15min": 28,
-        "1h": 18,
-        "4h": 12,
-        "1day": 8,
-    }.get(interval, 12)
-    # Future projection logic for Category Axis (Strings) is tricky.
-    # We will just use index-based placement or skip projection for cleanliness if needed.
-    # For now, let's keep it simple: No empty future bars to avoid category issues.
-    # If users really need it, we must append empty strings to plot_time_str.
-    pass # Removed projection for robustness with category axis
     
     if selected_strategy == "SMC (BOS/OB/FVG)":
         for zone in analysis.get("fvg_zones", [])[-4:]:
-            # Use Index for X-coordinates on Category Axis
             x0_idx = zone["start_index"]
-            if x0_idx < len(plot_time_str):
-                x0 = plot_time_str[x0_idx]
-                # Draw shape extending to right edge (approx)
+            if x0_idx < len(plot_time):
+                x0 = plot_time.iloc[x0_idx]
                 fig.add_shape(
-                    type="rect", xref="x", yref="y", x0=x0, x1=plot_time_str[-1], y0=zone["low"], y1=zone["high"],
+                    type="rect", xref="x", yref="y", x0=x0, x1=plot_time.iloc[-1], y0=zone["low"], y1=zone["high"],
                     fillcolor="rgba(147, 197, 253, 0.25)", line=dict(color="rgba(59,130,246,0.38)", width=1), row=1, col=1,
                 )
         for zone in analysis.get("ob_zones", [])[-4:]:
             x0_idx = zone["index"]
-            if x0_idx < len(plot_time_str):
-                x0 = plot_time_str[x0_idx]
+            if x0_idx < len(plot_time):
+                x0 = plot_time.iloc[x0_idx]
                 fig.add_shape(
-                    type="rect", xref="x", yref="y", x0=x0, x1=plot_time_str[-1], y0=zone["low"], y1=zone["high"],
+                    type="rect", xref="x", yref="y", x0=x0, x1=plot_time.iloc[-1], y0=zone["low"], y1=zone["high"],
                     fillcolor="rgba(110, 231, 183, 0.28)", line=dict(color="rgba(16,185,129,0.42)", width=1), row=1, col=1,
                 )
         for bos in analysis.get("bos_events", [])[-8:]:
             idx = bos["index"]
-            if idx < len(plot_time_str):
+            if idx < len(plot_time):
                 fig.add_annotation(
-                    x=plot_time_str[idx], y=df["high"].iloc[idx], text="BOS", showarrow=True, arrowhead=2,
+                    x=plot_time.iloc[idx], y=df["high"].iloc[idx], text="BOS", showarrow=True, arrowhead=2,
                     font=dict(color="#1e3a8a", size=10), bgcolor="rgba(255,255,255,0.75)", bordercolor="rgba(147,197,253,0.7)",
                     row=1, col=1,
                 )
 
     if selected_strategy == "Momentum Breakout (EMA50 + VCP)":
         fig.add_trace(
-            go.Scatter(x=plot_time_str, y=df["ema50"], mode="lines", line=dict(color="#2563eb", width=1.9), name="EMA 50"),
+            go.Scatter(x=plot_time, y=df["ema50"], mode="lines", line=dict(color="#2563eb", width=1.9), name="EMA 50"),
             row=1,
             col=1,
         )
@@ -2275,7 +2371,7 @@ def make_figure(
 
     if selected_strategy == "Pullback Reversal (EMA200 + Fib + RSI)":
         fig.add_trace(
-            go.Scatter(x=plot_time_str, y=df["ema200"], mode="lines", line=dict(color="#0f766e", width=2.0), name="EMA 200"),
+            go.Scatter(x=plot_time, y=df["ema200"], mode="lines", line=dict(color="#0f766e", width=2.0), name="EMA 200"),
         )
         fib = analysis["fib"]
         fib50, fib618 = fib["50"], fib["61_8"]
@@ -2284,14 +2380,14 @@ def make_figure(
         
         # Fib Zone
         low_idx = fib.get("low_idx", 0)
-        if 0 <= low_idx < len(plot_time_str):
-            x0 = plot_time_str[low_idx]
+        if 0 <= low_idx < len(plot_time):
+            x0 = plot_time.iloc[low_idx]
             fig.add_shape(
                 type="rect",
                 xref="x",
                 yref="y",
                 x0=x0,
-                x1=plot_time_str[-1],
+                x1=plot_time.iloc[-1],
                 y0=min(fib50, fib618),
                 y1=max(fib50, fib618),
                 fillcolor="rgba(254, 243, 199, 0.45)",
@@ -2325,7 +2421,7 @@ def make_figure(
         font=dict(color="#1e293b", size=12),
         hoverlabel=dict(bgcolor="#ffffff", font_color="#111827", bordercolor="#d1d5db"),
         dragmode="pan",
-        hovermode="closest",
+        hovermode="x unified",
         hoverdistance=8,
         spikedistance=1000,
         uirevision=f"zenith-chart-{chart_revision}",
@@ -2382,40 +2478,16 @@ def make_figure(
         spikesnap="cursor",
         spikemode="toaxis+across",
     )
-    # Update layout to remove gaps (TradingView style) and maximize height
     fig.update_xaxes(
-        type="category",  # Forces continuous candles with no time gaps
-        tickangle=-45,
-        nticks=20,  # Limit ticks to prevent overcrowding
+        type="date",
         showgrid=True,
         gridcolor="#f1f5f9",
         fixedrange=False,
         spikecolor="#334155",
         spikethickness=1,
+        rangebreaks=build_xaxis_rangebreaks(interval, market_mode),
+        tickformat="%d %b\n%H:%M" if interval in ("15min", "1h", "4h") else "%d %b\n%Y",
     )
-    fig.update_yaxes(
-        showgrid=True,
-        gridcolor="#f1f5f9",
-        fixedrange=False,
-    )
-    fig.update_layout(
-        height=800,  # Increased overall height
-        margin=dict(t=20, b=10, l=10, r=10),
-        paper_bgcolor="#ffffff",
-        plot_bgcolor="#ffffff",
-        hovermode="x unified",
-        dragmode="pan",
-        showlegend=False,
-    )
-
-    # Remove dynamic range breaks and rely on Category Axis
-    # This ensures "No Gaps" for weekends/holidays naturally.
-    if len(plot_time_str) > 0:
-        fig.update_xaxes(
-             # Use the first and last formatted string to set the range
-            range=[plot_time_str[0], plot_time_str[-1]],
-            type="category" # Enforce category to respect the string list
-        )
 
     vol_ceiling = float(df["volume"].quantile(0.97))
     if vol_ceiling > 0:
@@ -2487,55 +2559,6 @@ def render_top_stats(df: pd.DataFrame, ticker: str, interval: str) -> None:
 def main() -> None:
     if "sidebar_mini" not in st.session_state:
         st.session_state["sidebar_mini"] = False
-    # --- Sidebar Controls ---
-    st.sidebar.title("Zenith Analysis")
-    
-    st.sidebar.markdown("---")
-    
-    # ... (rest of sidebar code)
-
-    # Move version to bottom
-    # Version removed to avoid duplication
-    
-    # Initialize df to avoid UnboundLocalError
-    df = pd.DataFrame()
-
-    # ... (rest of main)
-    
-    # Data Fetching Logic (Simplified for context)
-    # if st.sidebar.button("Analyze"):
-    #     df = fetch_ohlcv_twelvedata(...)
-    
-    # ...
-    
-    # CRITICAL FIX: Only run this logic if df is valid and has data
-    if not df.empty:
-        # Calculate dynamic rangebreaks...
-        # This makes the chart continuous like TradingView
-        dt_diffs = df["timestamp"].diff().dt.total_seconds().dropna()
-        if not dt_diffs.empty:
-             # Most common diff is the interval
-            mode_diff = dt_diffs.mode().iloc[0]
-            # Find gaps larger than 1.5x the interval
-            gaps = df[df["timestamp"].diff().dt.total_seconds() > mode_diff * 1.5]
-            
-            # Simple approach: Use Plotly's 'category' axis if data < 1000 bars for perfect continuity
-            # OR use rangebreaks. Let's try rangebreaks first as category axis breaks strict time labels.
-            # Actually, standard TradingView style usually just hides weekends and potentially hours.
-            # BUT user complained about "sections".
-            # Let's try removing the 'rangebreaks' logic I added earlier and rely on `type='date'` 
-            # with NO breaks, but if that still shows gaps, we need `rangebreaks`.
-            # The user wants "NO GAPS". The only way to guarantee NO GAPS for irregular data is `type='category'`.
-            pass
-
-    # ...
-
-        # ... (inside if not df.empty)
-        # Display the chart only if we have data and a figure
-        st.plotly_chart(fig, use_container_width=True, height=760)
-
-    # Version Label at Bottom (Reverted to v1.1.1)
-    # Version removed to avoid duplication
     
     if "interval_sel" not in st.session_state:
         st.session_state["interval_sel"] = INTERVAL_OPTIONS[0]
@@ -2548,9 +2571,13 @@ def main() -> None:
     if "strategy_sel" not in st.session_state:
         st.session_state["strategy_sel"] = STRATEGY_OPTIONS[0]
     if "run_analysis" not in st.session_state:
-        st.session_state["run_analysis"] = False
+        st.session_state["run_analysis"] = True
     if "active_params" not in st.session_state:
-        st.session_state["active_params"] = None
+        st.session_state["active_params"] = (
+            st.session_state["ticker_sel"],
+            st.session_state["interval_sel"],
+            st.session_state["strategy_sel"],
+        )
     if "cached_params" not in st.session_state:
         st.session_state["cached_params"] = None
     if "cached_df" not in st.session_state:
@@ -2630,13 +2657,12 @@ def main() -> None:
     refresh = False
     with st.sidebar:
         if not st.session_state["sidebar_mini"]:
-            title_col, toggle_col = st.columns([0.74, 0.26], gap="small")
-            with title_col:
-                st.markdown("<div class='controls-title'>Zenith Controls</div>", unsafe_allow_html=True)
+            _, toggle_col = st.columns([0.72, 0.28], gap="small")
             with toggle_col:
                 if st.button("«", key="sidebar_mini_toggle", use_container_width=True, help="ย่อเมนู"):
                     st.session_state["sidebar_mini"] = True
                     st.rerun()
+            st.markdown("<div class='controls-title'>Zenith Controls</div>", unsafe_allow_html=True)
             st.selectbox("🕒 Timeframe", INTERVAL_OPTIONS, key="interval_sel")
             st.session_state["ticker_options"] = merge_unique_symbols(
                 [st.session_state["ticker_sel"]],
@@ -2873,10 +2899,6 @@ def main() -> None:
     display_strategy = active_params[2] if active_params else selected_strategy
 
     manual_html = strategy_guide(display_strategy)
-
-    if not st.session_state["run_analysis"]:
-        st.markdown("<div class='hint-card'>เลือกหุ้น, Timeframe และกลยุทธ์ จากนั้นกด Analyze เพื่อเริ่มวิเคราะห์</div>", unsafe_allow_html=True)
-        st.stop()
 
     if st.session_state["active_params"] is None:
         st.session_state["active_params"] = (selected_ticker, selected_interval, selected_strategy)
@@ -3151,7 +3173,7 @@ def main() -> None:
     left, right = st.columns([3.0, 1.0], gap="small")
 
     with left:
-        chart_height = 560
+        chart_height = 500
         fig_key = (
             ticker,
             interval,
@@ -3510,5 +3532,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
