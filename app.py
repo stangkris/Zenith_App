@@ -50,7 +50,7 @@ STRATEGY_OPTIONS = [
     "Volume Profile (POC)",
 ]
 INTERVAL_OPTIONS = ["15min", "1h", "4h", "1day"]
-FIGURE_SCHEMA_VERSION = 7
+FIGURE_SCHEMA_VERSION = 9
 BACKTEST_CACHE_FILE = Path(__file__).with_name("backtest_trades.csv")
 BACKTEST_SCHEMA_VERSION = 3
 BACKTEST_DEFAULT_REFRESH_DAYS = 1
@@ -1399,6 +1399,14 @@ def inject_css(mini_mode: bool = False) -> None:
                 border: 1px solid #dbe2ea;
                 background: #ffffff;
                 position: relative;
+                contain: layout paint style;
+            }
+
+            .stPlotlyChart .js-plotly-plot,
+            .stPlotlyChart .plot-container,
+            .stPlotlyChart .svg-container {
+                max-height: 100% !important;
+                overflow: hidden !important;
             }
 
             .stSelectbox label, .stTextInput label, .stRadio label, .stMarkdown, .stCaption {
@@ -1865,10 +1873,6 @@ def to_plot_timestamps(ts: pd.Series, market_mode: str) -> pd.Series:
         parsed = parsed.dt.tz_localize("Asia/Bangkok")
     else:
         parsed = parsed.dt.tz_convert("Asia/Bangkok")
-    if market_mode == "us_equity":
-        parsed = parsed.dt.tz_convert("America/New_York")
-    elif market_mode == "crypto_24x7":
-        parsed = parsed.dt.tz_convert("UTC")
     return parsed.dt.tz_localize(None)
 
 
@@ -1894,6 +1898,42 @@ def _missing_us_equity_session_days(plot_time: pd.Series | None) -> list[str]:
     return [pd.Timestamp(day).strftime("%Y-%m-%d") for day in missing_days]
 
 
+def _infer_us_intraday_hide_bounds_bkk(plot_time: pd.Series | None) -> tuple[float, float]:
+    # Default US regular session in Thailand time during EST: 21:30 -> 04:00.
+    default_open_min = (21 * 60) + 30
+    default_close_min = (4 * 60)
+    if plot_time is None:
+        return default_close_min / 60.0, default_open_min / 60.0
+
+    ts = pd.to_datetime(plot_time, errors="coerce").dropna()
+    if ts.empty:
+        return default_close_min / 60.0, default_open_min / 60.0
+
+    day_open = (
+        pd.DataFrame({"ts": ts, "day": ts.dt.normalize()})
+        .groupby("day", sort=True)["ts"]
+        .min()
+    )
+    if day_open.empty:
+        return default_close_min / 60.0, default_open_min / 60.0
+
+    open_mins = (day_open.dt.hour * 60 + day_open.dt.minute).astype(int)
+    if open_mins.empty:
+        return default_close_min / 60.0, default_open_min / 60.0
+
+    try:
+        open_min = int(open_mins.mode().iloc[0])
+    except Exception:
+        open_min = int(open_mins.median())
+
+    # Guard against anomalous data; expected US open in BKK is around 20:30-21:30.
+    if open_min < (19 * 60) or open_min > (23 * 60):
+        open_min = default_open_min
+
+    close_min = (open_min + (6 * 60) + 30) % (24 * 60)
+    return round(close_min / 60.0, 2), round(open_min / 60.0, 2)
+
+
 def build_xaxis_rangebreaks(interval: str, market_mode: str, plot_time: pd.Series | None = None) -> list[dict[str, Any]]:
     if market_mode == "crypto_24x7":
         return []
@@ -1904,7 +1944,8 @@ def build_xaxis_rangebreaks(interval: str, market_mode: str, plot_time: pd.Serie
         if missing_session_days:
             breaks.append(dict(values=missing_session_days))
     if market_mode == "us_equity" and interval in {"15min", "1h", "4h"}:
-        breaks.append(dict(bounds=[16, 9.5], pattern="hour"))
+        hide_start, hide_end = _infer_us_intraday_hide_bounds_bkk(plot_time)
+        breaks.append(dict(bounds=[hide_start, hide_end], pattern="hour"))
     return breaks
 
 
@@ -3231,7 +3272,7 @@ def main() -> None:
     left, right = st.columns([3.0, 1.0], gap="small")
 
     with left:
-        chart_height = 680
+        chart_height = 500
         fig_key = (
             ticker,
             interval,
@@ -3338,11 +3379,18 @@ def main() -> None:
                   host.__zenithYCursorCleanup();
                 }
 
+                let rafToken = 0;
+                let lastMoveEvent = null;
                 const hideLabel = () => {
+                  lastMoveEvent = null;
+                  if (rafToken) {
+                    w.cancelAnimationFrame(rafToken);
+                    rafToken = 0;
+                  }
                   label.style.display = 'none';
                   guide.style.display = 'none';
                 };
-                const onMove = (ev) => {
+                const renderCursor = (ev) => {
                   const full = plot && plot._fullLayout;
                   if (!full || !full._size || !full.yaxis || !full.yaxis.range || !full.yaxis.domain) {
                     hideLabel();
@@ -3386,6 +3434,16 @@ def main() -> None:
                   guide.style.top = `${Math.max(0, y)}px`;
                   guide.style.display = 'block';
                 };
+                const onMove = (ev) => {
+                  lastMoveEvent = ev;
+                  if (rafToken) return;
+                  rafToken = w.requestAnimationFrame(() => {
+                    rafToken = 0;
+                    if (lastMoveEvent) {
+                      renderCursor(lastMoveEvent);
+                    }
+                  });
+                };
 
                 host.addEventListener('mousemove', onMove);
                 host.addEventListener('mouseleave', hideLabel);
@@ -3396,6 +3454,10 @@ def main() -> None:
                 }
 
                 host.__zenithYCursorCleanup = () => {
+                  if (rafToken) {
+                    w.cancelAnimationFrame(rafToken);
+                    rafToken = 0;
+                  }
                   host.removeEventListener('mousemove', onMove);
                   host.removeEventListener('mouseleave', hideLabel);
                   host.removeEventListener('mousedown', hideLabel);
@@ -3433,8 +3495,8 @@ def main() -> None:
 
                 const bottomPadding = 14;
                 const available = Math.floor(viewportH - rect.top - bottomPadding);
-                const target = Math.max(620, Math.min(980, available));
-                if (!Number.isFinite(target) || target <= 0) return;
+                if (!Number.isFinite(available) || available <= 180) return;
+                const target = Math.floor(Math.min(920, available));
 
                 const prev = Number(host.getAttribute('data-zenith-fit-h') || '0');
                 if (Math.abs(prev - target) < 6) return;
@@ -3442,6 +3504,7 @@ def main() -> None:
                 host.setAttribute('data-zenith-fit-h', String(target));
                 host.style.minHeight = `${target}px`;
                 host.style.height = `${target}px`;
+                host.style.overflow = 'hidden';
                 api.relayout(plot, { height: target });
               }
 
@@ -3480,7 +3543,10 @@ def main() -> None:
                 const modebar = host.querySelector('.modebar');
                 if (modebar) modebar.style.display = 'none';
 
-                bindYAxisCursor(host, plot);
+                if (host.__zenithBoundPlot !== plot) {
+                  bindYAxisCursor(host, plot);
+                  host.__zenithBoundPlot = plot;
+                }
                 fitPlotHeight(host, plot);
 
                 let tools = host.querySelector('.zenith-plot-tools');
@@ -3494,13 +3560,11 @@ def main() -> None:
                     right: '10px',
                     zIndex: '12',
                     display: 'flex',
-                    gap: '6px',
-                    padding: '4px',
-                    borderRadius: '999px',
-                    border: '1px solid rgba(148, 163, 184, 0.55)',
-                    background: 'rgba(255, 255, 255, 0.94)',
-                    backdropFilter: 'blur(4px)',
-                    boxShadow: '0 8px 20px rgba(15, 23, 42, 0.12)'
+                    gap: '0',
+                    padding: '0',
+                    border: 'none',
+                    background: 'transparent',
+                    boxShadow: 'none'
                   });
                   host.appendChild(tools);
                 }
@@ -3518,36 +3582,32 @@ def main() -> None:
                   resetBtn.className = 'zenith-reset-btn';
                   resetBtn.title = 'Reset view';
                   resetBtn.setAttribute('aria-label', 'Reset view');
-                  resetBtn.innerHTML = `${resetIcon}<span>Reset View</span>`;
+                  resetBtn.innerHTML = resetIcon;
                   Object.assign(resetBtn.style, {
-                    height: '32px',
-                    padding: '0 12px',
-                    borderRadius: '999px',
-                    border: '1px solid #99f6e4',
-                    background: 'linear-gradient(135deg, #ecfeff 0%, #f0fdfa 100%)',
-                    color: '#0f766e',
+                    width: '26px',
+                    height: '26px',
+                    padding: '0',
+                    borderRadius: '8px',
+                    border: '1px solid #cbd5e1',
+                    background: 'rgba(255, 255, 255, 0.84)',
+                    color: '#334155',
                     cursor: 'pointer',
                     display: 'inline-flex',
                     alignItems: 'center',
                     justifyContent: 'center',
-                    gap: '6px',
-                    fontSize: '12px',
-                    fontWeight: '700',
-                    letterSpacing: '0.02em',
-                    boxShadow: '0 2px 8px rgba(15, 23, 42, 0.10)',
-                    transition: 'all 140ms ease'
+                    lineHeight: '0',
+                    boxShadow: 'none',
+                    transition: 'all 100ms ease'
                   });
                   resetBtn.onmouseenter = () => {
-                    resetBtn.style.transform = 'translateY(-1px)';
-                    resetBtn.style.boxShadow = '0 4px 12px rgba(15, 23, 42, 0.14)';
-                    resetBtn.style.borderColor = '#5eead4';
-                    resetBtn.style.color = '#0f766e';
+                    resetBtn.style.background = '#f8fafc';
+                    resetBtn.style.borderColor = '#94a3b8';
+                    resetBtn.style.color = '#0f172a';
                   };
                   resetBtn.onmouseleave = () => {
-                    resetBtn.style.transform = 'translateY(0)';
-                    resetBtn.style.boxShadow = '0 2px 8px rgba(15, 23, 42, 0.10)';
-                    resetBtn.style.borderColor = '#99f6e4';
-                    resetBtn.style.color = '#0f766e';
+                    resetBtn.style.background = 'rgba(255, 255, 255, 0.84)';
+                    resetBtn.style.borderColor = '#cbd5e1';
+                    resetBtn.style.color = '#334155';
                   };
                   tools.appendChild(resetBtn);
                 }
@@ -3571,7 +3631,14 @@ def main() -> None:
 
               if (!w.__zenithToolbarObserverBound) {
                 w.__zenithToolbarObserverBound = true;
-                const observer = new MutationObserver(() => setupToolbarWithRetry(0));
+                let observerTimer = null;
+                const observer = new MutationObserver(() => {
+                  if (observerTimer) return;
+                  observerTimer = w.setTimeout(() => {
+                    observerTimer = null;
+                    setupToolbarWithRetry(0);
+                  }, 80);
+                });
                 observer.observe(w.document.body, { childList: true, subtree: true });
               }
               if (!w.__zenithPlotResizeBound) {
