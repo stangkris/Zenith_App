@@ -50,7 +50,7 @@ STRATEGY_OPTIONS = [
     "Volume Profile (POC)",
 ]
 INTERVAL_OPTIONS = ["15min", "1h", "4h", "1day"]
-FIGURE_SCHEMA_VERSION = 6
+FIGURE_SCHEMA_VERSION = 7
 BACKTEST_CACHE_FILE = Path(__file__).with_name("backtest_trades.csv")
 BACKTEST_SCHEMA_VERSION = 3
 BACKTEST_DEFAULT_REFRESH_DAYS = 1
@@ -1872,11 +1872,37 @@ def to_plot_timestamps(ts: pd.Series, market_mode: str) -> pd.Series:
     return parsed.dt.tz_localize(None)
 
 
-def build_xaxis_rangebreaks(interval: str, market_mode: str) -> list[dict[str, Any]]:
+def _missing_us_equity_session_days(plot_time: pd.Series | None) -> list[str]:
+    if plot_time is None:
+        return []
+
+    ts = pd.to_datetime(plot_time, errors="coerce")
+    ts = ts.dropna()
+    if ts.empty:
+        return []
+
+    seen_days = pd.Index(ts.dt.normalize().unique()).sort_values()
+    if seen_days.empty:
+        return []
+
+    start_day = pd.Timestamp(seen_days.min()).normalize()
+    end_day = pd.Timestamp(seen_days.max()).normalize()
+    expected_weekdays = pd.date_range(start_day, end_day, freq="B")
+    missing_days = expected_weekdays.difference(seen_days)
+    if missing_days.empty:
+        return []
+    return [pd.Timestamp(day).strftime("%Y-%m-%d") for day in missing_days]
+
+
+def build_xaxis_rangebreaks(interval: str, market_mode: str, plot_time: pd.Series | None = None) -> list[dict[str, Any]]:
     if market_mode == "crypto_24x7":
         return []
 
     breaks: list[dict[str, Any]] = [dict(bounds=["sat", "mon"])]
+    if market_mode == "us_equity":
+        missing_session_days = _missing_us_equity_session_days(plot_time)
+        if missing_session_days:
+            breaks.append(dict(values=missing_session_days))
     if market_mode == "us_equity" and interval in {"15min", "1h", "4h"}:
         breaks.append(dict(bounds=[16, 9.5], pattern="hour"))
     return breaks
@@ -2506,7 +2532,7 @@ def make_figure(
         fixedrange=False,
         spikecolor="#334155",
         spikethickness=1,
-        rangebreaks=build_xaxis_rangebreaks(interval, market_mode),
+        rangebreaks=build_xaxis_rangebreaks(interval, market_mode, plot_time),
         tickformat="%d %b\n%H:%M" if interval in ("15min", "1h", "4h") else "%d %b\n%Y",
     )
 
@@ -3380,8 +3406,21 @@ def main() -> None:
                 };
               }
 
+              function getPlotlyApi(plot) {
+                if (w.Plotly && typeof w.Plotly.relayout === 'function') return w.Plotly;
+                if (plot && plot._context && plot._context._plotlyjs && typeof plot._context._plotlyjs.relayout === 'function') {
+                  return plot._context._plotlyjs;
+                }
+                if (plot && plot.__plotly && plot.__plotly.Plotly && typeof plot.__plotly.Plotly.relayout === 'function') {
+                  return plot.__plotly.Plotly;
+                }
+                return null;
+              }
+
               function fitPlotHeight(host, plot) {
-                if (!w.Plotly || !host || !plot) return;
+                if (!host || !plot) return;
+                const api = getPlotlyApi(plot);
+                if (!api) return;
                 const doc = w.document;
                 const viewportH = Math.max(
                   Number(w.innerHeight) || 0,
@@ -3403,7 +3442,33 @@ def main() -> None:
                 host.setAttribute('data-zenith-fit-h', String(target));
                 host.style.minHeight = `${target}px`;
                 host.style.height = `${target}px`;
-                w.Plotly.relayout(plot, { height: target });
+                api.relayout(plot, { height: target });
+              }
+
+              function resetPlotView(host, plot) {
+                const api = getPlotlyApi(plot);
+                if (api) {
+                  api.relayout(plot, {
+                    'xaxis.autorange': true,
+                    'xaxis2.autorange': true,
+                    'xaxis3.autorange': true,
+                    'yaxis.autorange': true,
+                    'yaxis2.autorange': true,
+                    'yaxis3.autorange': true,
+                    'xaxis.range': null,
+                    'xaxis2.range': null,
+                    'xaxis3.range': null,
+                    'yaxis.range': null,
+                    'yaxis2.range': null,
+                    'yaxis3.range': null
+                  }).then(() => fitPlotHeight(host, plot)).catch(() => {});
+                  return;
+                }
+
+                const dragLayer = host.querySelector('.draglayer');
+                if (dragLayer) {
+                  dragLayer.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: w }));
+                }
               }
 
               function setupToolbar() {
@@ -3429,47 +3494,18 @@ def main() -> None:
                     right: '10px',
                     zIndex: '12',
                     display: 'flex',
-                    gap: '4px',
-                    padding: '2px',
-                    borderRadius: '10px',
-                    border: '1px solid #e2e8f0',
-                    background: 'rgba(248, 250, 252, 0.94)',
-                    boxShadow: '0 2px 6px rgba(15, 23, 42, 0.08)'
+                    gap: '6px',
+                    padding: '4px',
+                    borderRadius: '999px',
+                    border: '1px solid rgba(148, 163, 184, 0.55)',
+                    background: 'rgba(255, 255, 255, 0.94)',
+                    backdropFilter: 'blur(4px)',
+                    boxShadow: '0 8px 20px rgba(15, 23, 42, 0.12)'
                   });
-
-                  const mkBtn = (title, iconSvg) => {
-                    const btn = w.document.createElement('button');
-                    btn.type = 'button';
-                    btn.title = title;
-                    btn.setAttribute('aria-label', title);
-                    btn.innerHTML = iconSvg;
-                    Object.assign(btn.style, {
-                      width: '30px',
-                      height: '28px',
-                      borderRadius: '8px',
-                      border: '1px solid #cbd5e1',
-                      background: '#ffffff',
-                      color: '#334155',
-                      cursor: 'pointer',
-                      display: 'inline-flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      boxShadow: '0 1px 2px rgba(15, 23, 42, 0.08)',
-                      transition: 'all 120ms ease'
-                    });
-                    btn.onmouseenter = () => {
-                      btn.style.background = '#f8fafc';
-                      btn.style.borderColor = '#94a3b8';
-                      btn.style.color = '#0f172a';
-                    };
-                    btn.onmouseleave = () => {
-                      btn.style.background = '#ffffff';
-                      btn.style.borderColor = '#cbd5e1';
-                      btn.style.color = '#334155';
-                    };
-                    return btn;
-                  };
-
+                  host.appendChild(tools);
+                }
+                let resetBtn = tools.querySelector('.zenith-reset-btn');
+                if (!resetBtn) {
                   const resetIcon = `
                     <svg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24'
                          fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>
@@ -3477,25 +3513,49 @@ def main() -> None:
                       <path d='M3 8a9 9 0 1 0 3-6.7'></path>
                     </svg>
                   `;
-                  const resetBtn = mkBtn('Reset view', resetIcon);
-
-                  resetBtn.onclick = (ev) => {
-                    ev.preventDefault();
-                    ev.stopPropagation();
-                    if (!w.Plotly || !plot) return;
-                    w.Plotly.relayout(plot, {
-                      'xaxis.autorange': true,
-                      'xaxis2.autorange': true,
-                      'xaxis3.autorange': true,
-                      'yaxis.autorange': true,
-                      'yaxis2.autorange': true,
-                      'yaxis3.autorange': true
-                    });
+                  resetBtn = w.document.createElement('button');
+                  resetBtn.type = 'button';
+                  resetBtn.className = 'zenith-reset-btn';
+                  resetBtn.title = 'Reset view';
+                  resetBtn.setAttribute('aria-label', 'Reset view');
+                  resetBtn.innerHTML = `${resetIcon}<span>Reset View</span>`;
+                  Object.assign(resetBtn.style, {
+                    height: '32px',
+                    padding: '0 12px',
+                    borderRadius: '999px',
+                    border: '1px solid #99f6e4',
+                    background: 'linear-gradient(135deg, #ecfeff 0%, #f0fdfa 100%)',
+                    color: '#0f766e',
+                    cursor: 'pointer',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: '6px',
+                    fontSize: '12px',
+                    fontWeight: '700',
+                    letterSpacing: '0.02em',
+                    boxShadow: '0 2px 8px rgba(15, 23, 42, 0.10)',
+                    transition: 'all 140ms ease'
+                  });
+                  resetBtn.onmouseenter = () => {
+                    resetBtn.style.transform = 'translateY(-1px)';
+                    resetBtn.style.boxShadow = '0 4px 12px rgba(15, 23, 42, 0.14)';
+                    resetBtn.style.borderColor = '#5eead4';
+                    resetBtn.style.color = '#0f766e';
                   };
-
+                  resetBtn.onmouseleave = () => {
+                    resetBtn.style.transform = 'translateY(0)';
+                    resetBtn.style.boxShadow = '0 2px 8px rgba(15, 23, 42, 0.10)';
+                    resetBtn.style.borderColor = '#99f6e4';
+                    resetBtn.style.color = '#0f766e';
+                  };
                   tools.appendChild(resetBtn);
-                  host.appendChild(tools);
                 }
+                resetBtn.onclick = (ev) => {
+                  ev.preventDefault();
+                  ev.stopPropagation();
+                  resetPlotView(host, plot);
+                };
                 setTimeout(() => fitPlotHeight(host, plot), 80);
                 setTimeout(() => fitPlotHeight(host, plot), 220);
                 return true;
