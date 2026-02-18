@@ -50,7 +50,7 @@ STRATEGY_OPTIONS = [
     "Volume Profile (POC)",
 ]
 INTERVAL_OPTIONS = ["15min", "1h", "4h", "1day"]
-FIGURE_SCHEMA_VERSION = 9
+FIGURE_SCHEMA_VERSION = 10
 BACKTEST_CACHE_FILE = Path(__file__).with_name("backtest_trades.csv")
 BACKTEST_SCHEMA_VERSION = 3
 BACKTEST_DEFAULT_REFRESH_DAYS = 1
@@ -1403,13 +1403,6 @@ def inject_css(mini_mode: bool = False) -> None:
                 contain: layout paint style;
             }
 
-            .stPlotlyChart .js-plotly-plot,
-            .stPlotlyChart .plot-container,
-            .stPlotlyChart .svg-container {
-                max-height: 100% !important;
-                overflow: hidden !important;
-            }
-
             .stSelectbox label, .stTextInput label, .stRadio label, .stMarkdown, .stCaption {
                 color: var(--text) !important;
             }
@@ -2342,12 +2335,14 @@ def make_figure(
         )
     ]
 
+    is_us_intraday = market_mode == "us_equity" and interval in {"15min", "1h", "4h"}
+
     fig = make_subplots(
         rows=3,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.02, # Reduced gap
-        row_heights=[0.7, 0.15, 0.15], # Taller Price Chart (70%)
+        vertical_spacing=0.014,
+        row_heights=[0.62, 0.19, 0.19],
         subplot_titles=(
             "MAIN CHART (OHLC + STRATEGY ZONES)",
             "VOLUME",
@@ -2521,7 +2516,7 @@ def make_figure(
     fig.update_layout(
         template="plotly_white",
         height=chart_height,
-        margin=dict(l=12, r=12, t=34, b=6),
+        margin=dict(l=12, r=12, t=28, b=2),
         legend=dict(
             orientation="h",
             yanchor="bottom",
@@ -2594,16 +2589,28 @@ def make_figure(
         spikesnap="cursor",
         spikemode="toaxis+across",
     )
-    fig.update_xaxes(
-        type="date",
-        showgrid=True,
-        gridcolor="#f1f5f9",
-        fixedrange=False,
-        spikecolor="#334155",
-        spikethickness=1,
-        rangebreaks=build_xaxis_rangebreaks(interval, market_mode, plot_time),
-        tickformat="%d %b\n%H:%M" if interval in ("15min", "1h", "4h") else "%d %b\n%Y",
-    )
+    if is_us_intraday:
+        # Use category axis for US intraday to fully compress non-trading gaps
+        # (overnight/weekend/holiday) into a continuous candle sequence.
+        fig.update_xaxes(
+            type="category",
+            showgrid=True,
+            gridcolor="#f1f5f9",
+            fixedrange=False,
+            spikecolor="#334155",
+            spikethickness=1,
+        )
+    else:
+        fig.update_xaxes(
+            type="date",
+            showgrid=True,
+            gridcolor="#f1f5f9",
+            fixedrange=False,
+            spikecolor="#334155",
+            spikethickness=1,
+            rangebreaks=build_xaxis_rangebreaks(interval, market_mode, plot_time),
+            tickformat="%d %b\n%H:%M" if interval in ("15min", "1h", "4h") else "%d %b\n%Y",
+        )
 
     vol_ceiling = float(df["volume"].quantile(0.97))
     if vol_ceiling > 0:
@@ -3319,7 +3326,7 @@ def main() -> None:
     left, right = st.columns([3.0, 1.0], gap="small")
 
     with left:
-        chart_height = 500
+        chart_height = 560
         fig_key = (
             ticker,
             interval,
