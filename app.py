@@ -50,7 +50,7 @@ STRATEGY_OPTIONS = [
     "Volume Profile (POC)",
 ]
 INTERVAL_OPTIONS = ["15min", "1h", "4h", "1day"]
-FIGURE_SCHEMA_VERSION = 5
+FIGURE_SCHEMA_VERSION = 6
 BACKTEST_CACHE_FILE = Path(__file__).with_name("backtest_trades.csv")
 BACKTEST_SCHEMA_VERSION = 3
 BACKTEST_DEFAULT_REFRESH_DAYS = 1
@@ -920,11 +920,11 @@ def inject_css(mini_mode: bool = False) -> None:
 
             .block-container {
                 padding-top: 0.32rem;
-                padding-bottom: 0.42rem;
+                padding-bottom: 0.12rem;
                 padding-left: 1rem;
                 padding-right: 1rem;
                 max-width: 1860px;
-                height: calc(100vh - 0.55rem);
+                height: calc(100vh - 0.35rem);
                 overflow: hidden !important;
             }
 
@@ -1432,6 +1432,22 @@ def inject_css(mini_mode: bool = False) -> None:
                 cursor: pointer !important;
             }
 
+            /* Force hand cursor for all interactive controls (buttons/selects/popovers/sidebar controls) */
+            .stApp button,
+            .stApp [role="button"],
+            .stApp [data-testid="stPopover"] > button,
+            .stApp [data-testid="stPopover"] button,
+            .stApp button[data-testid="stPopoverButton"],
+            .stApp div[data-baseweb="select"],
+            .stApp div[data-baseweb="select"] *,
+            .stApp div[data-baseweb="input"] > div,
+            .stApp [data-testid="stSelectbox"] *,
+            .stApp [data-testid="stTextInput"] *,
+            .stApp [data-testid="stSidebar"] .stCaption,
+            .stApp [data-testid="stSidebar"] label {
+                cursor: pointer !important;
+            }
+
             /* Alerts readability */
             div[data-testid="stAlert"] {
                 border-radius: 12px;
@@ -1849,6 +1865,10 @@ def to_plot_timestamps(ts: pd.Series, market_mode: str) -> pd.Series:
         parsed = parsed.dt.tz_localize("Asia/Bangkok")
     else:
         parsed = parsed.dt.tz_convert("Asia/Bangkok")
+    if market_mode == "us_equity":
+        parsed = parsed.dt.tz_convert("America/New_York")
+    elif market_mode == "crypto_24x7":
+        parsed = parsed.dt.tz_convert("UTC")
     return parsed.dt.tz_localize(None)
 
 
@@ -1856,9 +1876,10 @@ def build_xaxis_rangebreaks(interval: str, market_mode: str) -> list[dict[str, A
     if market_mode == "crypto_24x7":
         return []
 
-    # Only hide weekends. Intraday gaps vary by DST in Thai time (21:30-04:00 vs 20:30-03:00)
-    # so we avoid hardcoded hour breaks to prevent hiding valid data.
-    return [dict(bounds=["sat", "mon"])]
+    breaks: list[dict[str, Any]] = [dict(bounds=["sat", "mon"])]
+    if market_mode == "us_equity" and interval in {"15min", "1h", "4h"}:
+        breaks.append(dict(bounds=[16, 9.5], pattern="hour"))
+    return breaks
 
 
 @st.cache_data(show_spinner=False, ttl=180)
@@ -2533,9 +2554,38 @@ def market_phase_context(last_ts: pd.Timestamp) -> str:
     return phase
 
 
-def render_top_stats(df: pd.DataFrame, ticker: str, interval: str) -> None:
+def _daily_change_reference(df: pd.DataFrame, market_mode: str) -> tuple[float, float]:
     last_close = float(df["close"].iloc[-1])
-    prev_close = float(df["close"].iloc[-2]) if len(df) > 1 else last_close
+    if len(df) < 2:
+        return last_close, last_close
+
+    ts = pd.to_datetime(df["timestamp"], errors="coerce")
+    if getattr(ts.dt, "tz", None) is None:
+        ts = ts.dt.tz_localize("Asia/Bangkok")
+    else:
+        ts = ts.dt.tz_convert("Asia/Bangkok")
+
+    if market_mode == "us_equity":
+        ts = ts.dt.tz_convert("America/New_York")
+    elif market_mode == "crypto_24x7":
+        ts = ts.dt.tz_convert("UTC")
+
+    close_num = pd.to_numeric(df["close"], errors="coerce")
+    day_df = pd.DataFrame({"session_day": ts.dt.date, "close": close_num}).dropna()
+    if day_df.empty:
+        prev_close = float(df["close"].iloc[-2])
+        return last_close, prev_close
+
+    session_close = day_df.groupby("session_day", sort=True)["close"].last()
+    if len(session_close) >= 2:
+        prev_close = float(session_close.iloc[-2])
+    else:
+        prev_close = float(df["close"].iloc[-2])
+    return last_close, prev_close
+
+
+def render_top_stats(df: pd.DataFrame, ticker: str, interval: str, market_mode: str) -> None:
+    last_close, prev_close = _daily_change_reference(df, market_mode)
     chg = last_close - prev_close
     chg_pct = (chg / prev_close * 100) if prev_close else 0.0
     color = "#0f766e" if chg >= 0 else "#b91c1c"
@@ -2548,7 +2598,7 @@ def render_top_stats(df: pd.DataFrame, ticker: str, interval: str) -> None:
     c4.markdown(
         (
             "<div class='stat-card'>"
-            f"<div class='tiny-label' style='white-space: nowrap;'>เปลี่ยนแปลง (Daily Change) • <span class='phase-pill' style='color:{color}; border-color:{color};'>{phase}</span></div>"
+            f"<div class='tiny-label' style='white-space: nowrap;'>เปลี่ยนแปลง (Daily Change vs Prev Session) • <span class='phase-pill' style='color:{color}; border-color:{color};'>{phase}</span></div>"
             f"<div class='stat-value' style='color:{color};'>{chg:+.2f} ({chg_pct:+.2f}%)</div>"
             "</div>"
         ),
@@ -2681,97 +2731,50 @@ def main() -> None:
             st.selectbox("🧠 กลยุทธ์ (Strategy)", STRATEGY_OPTIONS, key="strategy_sel")
             refresh = st.button("📊 Analyze", use_container_width=True)
             st.markdown("<div class='side-spacer'></div>", unsafe_allow_html=True)
-            _patch_note_content = (
+            _patch_note_content_120 = (
+                "<h3 style='margin:0 0 6px 0;color:#0f766e;'>🚀 Patch Note — V1.2.0</h3>"
+                "<p style='font-size:12px;color:#64748b;margin:0 0 10px 0;'>Release Date: 2026-02-18</p>"
+                "<div style='background:#f0fdfa;padding:10px 12px;border-radius:8px;border:1px solid #ccfbf1;margin-bottom:10px;'>"
+                "<div style='font-size:12px;font-weight:700;color:#115e59;margin-bottom:4px;'>Backtest + UI Quality Upgrade</div>"
+                "<ul style='margin:0;padding-left:16px;font-size:12px;color:#334155;line-height:1.55;'>"
+                "<li>Backtest รองรับ Order Type แยกตามกลยุทธ์: Market / Limit / Stop</li>"
+                "<li>แก้ Momentum breakout trigger ให้ทำงานตามโครงสร้าง breakout จริง</li>"
+                "<li>เพิ่ม data digest ใน cache เพื่อกันผล backtest ค้างเมื่อข้อมูลย้อนหลังถูกแก้</li>"
+                "<li>แก้การคำนวณช่วงสแกนสัญญาณ + ช่วงวันที่ใน summary ให้ตรงกับช่วงที่คำนวณจริง</li>"
+                "<li>เพิ่ม Filled Trades / Fill Rate แยกจาก Signal Count ใน Backtest Results</li>"
+                "<li>ปรับ Max Drawdown ให้คำนวณตามลำดับเวลาอย่างถูกต้อง</li>"
+                "<li>ปรับ UX เพิ่มเติม: cursor แบบมือใน controls ที่กดได้, กราฟขยายเต็มพื้นที่มากขึ้น</li>"
+                "<li>แก้ Daily Change ให้เทียบกับ Previous Session Close แทน bar ก่อนหน้า</li>"
+                "<li>ปรับความต่อเนื่องกราฟ intraday (ซ่อนช่วงนอกเวลาเทรดของ US equity)</li>"
+                "</ul>"
+                "</div>"
+                "<div style='font-size:11px;color:#94a3b8;'>"
+                "🧪 เพิ่ม regression tests ครอบคลุม core logic ของ backtest และ strategy หลัก"
+                "</div>"
+            )
+            _patch_note_content_111 = (
                 "<h3 style='margin:0 0 6px 0;color:#0f766e;'>🔬 Patch Note — V1.1.1</h3>"
                 "<p style='font-size:12px;color:#64748b;margin:0 0 10px 0;'>Release Date: 2026-02-17</p>"
-                "<hr style='border:none;border-top:1px solid #e2e8f0;margin:8px 0;'>"
-                # ── Major Changes: What & Why ──
-                "<div style='background:#f0fdfa;padding:12px;border-radius:8px;border:1px solid #ccfbf1;margin-bottom:10px;'>"
-                "<h4 style='margin:0 0 4px 0;color:#115e59;font-size:13px;'>1. 🧠 Smart Take Profit (TP)</h4>"
-                "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;'>"
-                "<span style='font-size:11px;color:#64748b;background:#e2e8f0;padding:2px 6px;border-radius:4px;'>OLD: Fixed 2:1</span>"
-                "<span style='font-size:12px;color:#0f766e;'>➝</span>"
-                "<span style='font-size:11px;color:#064e3b;background:#d1fae5;padding:2px 6px;border-radius:4px;font-weight:600;'>NEW: Structure Based</span>"
-                "</div>"
-                # ── Technical Patch Note (Detailed) ──
-                "<div style='margin-bottom:12px;'>"
-                "<h4 style='margin:0 0 6px 0;color:#115e59;font-size:13px;'>1. ⚠️ Major Corrections (What Changed)</h4>"
-                "<p style='font-size:11px;color:#64748b;margin:0 0 8px 0;line-height:1.4;'>แก้ไขจุดอ่อนสำคัญที่พบใน System Audit (v1.1.0.md) เพื่อให้ผลลัพธ์มีความสมจริงและ logic ถูกต้องตามหลักการเทรด</p>"
-
-                # 1.1 TP Logic Table
-                "<div style='background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;overflow:hidden;margin-bottom:8px;'>"
-                "<div style='padding:6px 10px;background:#e2e8f0;font-size:11px;font-weight:700;color:#475569;'>1.1 Dynamic Take Profit (Structure Based)</div>"
-                "<table style='width:100%;border-collapse:collapse;font-size:11px;'>"
-                "<tr style='background:#f1f5f9;color:#64748b;'><th style='text-align:left;padding:4px 8px;font-weight:600;'>Strategy</th><th style='text-align:left;padding:4px 8px;font-weight:600;'>Old (Fixed 2R)</th><th style='text-align:left;padding:4px 8px;font-weight:600;color:#0f766e;'>New (Structure Based)</th></tr>"
-                "<tr><td style='padding:4px 8px;border-bottom:1px solid #f1f5f9;'>SMC</td><td style='padding:4px 8px;border-bottom:1px solid #f1f5f9;color:#94a3b8;'>Entry + 2R</td><td style='padding:4px 8px;border-bottom:1px solid #f1f5f9;color:#065f46;font-weight:500;'>Fib Ext 1.618 / Opposite Zone</td></tr>"
-                "<tr><td style='padding:4px 8px;border-bottom:1px solid #f1f5f9;'>Momentum</td><td style='padding:4px 8px;border-bottom:1px solid #f1f5f9;color:#94a3b8;'>Entry + 2R</td><td style='padding:4px 8px;border-bottom:1px solid #f1f5f9;color:#065f46;font-weight:500;'>Measured Move (Consolidation)</td></tr>"
-                "<tr><td style='padding:4px 8px;border-bottom:1px solid #f1f5f9;'>Pullback</td><td style='padding:4px 8px;border-bottom:1px solid #f1f5f9;color:#94a3b8;'>Entry + 2R</td><td style='padding:4px 8px;border-bottom:1px solid #f1f5f9;color:#065f46;font-weight:500;'>Swing High (Fib 0%)</td></tr>"
-                "<tr><td style='padding:4px 8px;'>Volume</td><td style='padding:4px 8px;color:#94a3b8;'>Entry + 2R</td><td style='padding:4px 8px;color:#065f46;font-weight:500;'>Value Area High (VAH)</td></tr>"
-                "</table>"
-                "</div>"
-
-                # 1.2 Trend Filter
-                "<div style='background:#f0fdfa;border:1px solid #ccfbf1;border-radius:6px;padding:8px 10px;margin-bottom:8px;'>"
-                "<div style='font-size:11px;font-weight:700;color:#115e59;margin-bottom:2px;'>1.2 Volume Profile Trend Fix</div>"
-                "<div style='font-size:11px;color:#334155;line-height:1.4;'>"
-                "<b>Old:</b> <span style='color:#ef4444;'>Hardcoded Rule = True</span> (ไม่มี Trend Filter)<br>"
-                "<b>New:</b> <span style='color:#059669;font-weight:600;'>Close > EMA50</span> (กรองเทรดสวนเทรนด์)"
-                "</div>"
-                "</div>"
-
-                # 1.3 Realism
-                "<div style='background:#fffbeb;border:1px solid #fcd34d;border-radius:6px;padding:8px 10px;margin-bottom:10px;'>"
-                "<div style='font-size:11px;font-weight:700;color:#92400e;margin-bottom:2px;'>1.3 Execution Realism Engine</div>"
-                "<div style='font-size:11px;color:#78350f;line-height:1.4;'>"
-                "<b>Old:</b> No Friction (0% Slippage, 0% Comm), Overlapping allowed.<br>"
-                "<b>New:</b> <span style='font-weight:600;'>Slippage 0.05%</span> + <span style='font-weight:600;'>Allocated Comm 0.1%</span> + <span style='font-weight:600;'>No Overlap Check</span>"
-                "</div>"
-                "</div>"
-                "</div>"
-
-                "<hr style='border:none;border-top:1px dashed #cbd5e1;margin:12px 0;'>"
-
-                # ── Validated Logic (Good) ──
-                "<h4 style='margin:0 0 6px 0;color:#334155;font-size:13px;'>2. ✅ Validated Core Logic (Unchanged)</h4>"
-                "<ul style='margin:0;padding-left:16px;font-size:11px;color:#475569;line-height:1.5;'>"
-                "<li><b>Pessimistic Intrabar:</b> ชน TP+SL ในแท่งเดียวกัน → นับเป็นแพ้ (To prevent overfitting)</li>"
-                "<li><b>Entry Limit Fill:</b> ราคาต้องแตะระดับ Entry จริงๆ ไม่ใช่เข้าที่ราคาปิด</li>"
-                "<li><b>Time Stop:</b> ปิดสถานะอัตโนมัติเมื่อครบ Time Horizon หากไม่ชน TP/SL</li>"
-                "<li><b>Cache System:</b> Incremental Cache ทำงานถูกต้อง ลดเวลาประมวลผล</li>"
-                "</ul>"
-                
-                "<hr style='border:none;border-top:1px dashed #cbd5e1;margin:12px 0;'>"
-
-                # ── Updated Score ──
-                "<h4 style='font-size:13px;color:#334155;margin:0 0 8px 0;'>📈 System Audit Score (V1.1.0)</h4>"
-                "<table style='width:100%;font-size:11px;border-collapse:collapse;'>"
-                "<tr><td style='padding:2px 0;color:#64748b;'>Realism Score</td><td style='text-align:right;color:#d97706;text-decoration:line-through;'>6/10</td><td style='text-align:right;color:#059669;font-weight:700;'>9/10</td></tr>"
-                "<tr><td style='padding:2px 0;color:#64748b;'>Logic Precision</td><td style='text-align:right;color:#d97706;text-decoration:line-through;'>8/10</td><td style='text-align:right;color:#059669;font-weight:700;'>9.5/10</td></tr>"
-                "<tr style='border-top:1px solid #e2e8f0;'><td style='padding:6px 0;font-weight:600;color:#0f172a;'>Total Score</td><td style='padding:6px 0;text-align:right;color:#64748b;text-decoration:line-through;'>8.2</td><td style='padding:6px 0;text-align:right;color:#0f766e;font-weight:700;font-size:13px;'>9.2 / 10</td></tr>"
-                "</table>"
-                "<hr style='border:none;border-top:1px solid #e2e8f0;margin:8px 0;'>"
-                # ── UI Changes ──
-                "<h4 style='font-size:13px;color:#334155;margin:8px 0 4px 0;'>🎨 UI / Design</h4>"
                 "<div style='font-size:12px;color:#475569;line-height:1.6;'>"
-                "• Backtest Popover: Header Teal, 2×2 metrics grid, collapsible notes<br>"
-                "• Strategy Guide Popover: ปรับ layout icon + numbered steps<br>"
-                "• Text Sizing: ปรับให้สม่ำเสมอทุกส่วน<br>"
-                "• เนื้อหาคงเดิม 100%</div>"
+                "• Smart Take Profit (Structure-Based) สำหรับทุกกลยุทธ์<br>"
+                "• ปรับ Realism Engine: Slippage / Commission / No Overlap<br>"
+                "• ปรับปรุง UI consistency และรายละเอียดใน popover ต่างๆ"
+                "</div>"
                 "<hr style='border:none;border-top:1px solid #e2e8f0;margin:8px 0;'>"
                 "<div style='font-size:11px;color:#94a3b8;'>"
-                "📚 อ้างอิง: Van Tharp, Pardo, Ernest Chan, Al Brooks, Minervini<br>"
-                "📝 รายละเอียดเพิ่มเติม: patch_notes/V1.1.0.md</div>"
+                "📝 รายละเอียดเต็ม: patch_notes/V1.1.0.md และ patch_notes/V1.1.1.md</div>"
             )
             st.markdown(
                 "<div class='side-footer'>"
-                "Zenith Analysis v1.1.1 | © 2026"
+                "Zenith Analysis v1.2.0 | © 2026"
                 "<br>Developed by: Krisanu Kinkhuntod"
                 "</div>",
                 unsafe_allow_html=True,
             )
             _pn_id = "zenith-patch-note-modal"
             # Escape content for JS string injection
-            _safe_content = _patch_note_content.replace("'", "\\'").replace("\n", "").replace('"', '\\"')
+            _safe_content_120 = _patch_note_content_120.replace("'", "\\'").replace("\n", "").replace('"', '\\"')
+            _safe_content_111 = _patch_note_content_111.replace("'", "\\'").replace("\n", "").replace('"', '\\"')
 
             # Inject modal logic via components.html to bypass Streamlit markdown limits
             components.html(
@@ -2851,7 +2854,36 @@ def main() -> None:
                             
                             // Inject Content
                             const contentDiv = parentDoc.createElement('div');
-                            contentDiv.innerHTML = '{_safe_content}';
+                            contentDiv.innerHTML = `
+                                <div style="display:flex;gap:8px;margin-bottom:10px;">
+                                    <button type="button" data-tab="v120" style="flex:1;padding:6px 8px;border:1px solid #99f6e4;background:#ecfeff;border-radius:8px;font-size:12px;font-weight:700;color:#115e59;cursor:pointer;">V1.2.0 (Latest)</button>
+                                    <button type="button" data-tab="v111" style="flex:1;padding:6px 8px;border:1px solid #cbd5e1;background:#f8fafc;border-radius:8px;font-size:12px;font-weight:700;color:#475569;cursor:pointer;">V1.1.1</button>
+                                </div>
+                                <div data-pane="v120">{_safe_content_120}</div>
+                                <div data-pane="v111" style="display:none;">{_safe_content_111}</div>
+                            `;
+
+                            const tabButtons = contentDiv.querySelectorAll('[data-tab]');
+                            const panes = contentDiv.querySelectorAll('[data-pane]');
+                            function activateTab(tabId) {{
+                                panes.forEach((p) => {{
+                                    p.style.display = (p.getAttribute('data-pane') === tabId) ? 'block' : 'none';
+                                }});
+                                tabButtons.forEach((b) => {{
+                                    const active = b.getAttribute('data-tab') === tabId;
+                                    b.style.background = active ? '#ecfeff' : '#f8fafc';
+                                    b.style.borderColor = active ? '#99f6e4' : '#cbd5e1';
+                                    b.style.color = active ? '#115e59' : '#475569';
+                                }});
+                            }}
+                            tabButtons.forEach((btn) => {{
+                                btn.onclick = (ev) => {{
+                                    ev.preventDefault();
+                                    ev.stopPropagation();
+                                    activateTab(btn.getAttribute('data-tab'));
+                                }};
+                            }});
+                            activateTab('v120');
                             
                             box.appendChild(closeBtn);
                             box.appendChild(contentDiv);
@@ -3167,13 +3199,13 @@ def main() -> None:
             width=0,
         )
 
-    render_top_stats(df, ticker, interval)
+    render_top_stats(df, ticker, interval, market_mode)
     st.markdown("<div class='section-gap'></div>", unsafe_allow_html=True)
 
     left, right = st.columns([3.0, 1.0], gap="small")
 
     with left:
-        chart_height = 500
+        chart_height = 680
         fig_key = (
             ticker,
             interval,
@@ -3348,6 +3380,32 @@ def main() -> None:
                 };
               }
 
+              function fitPlotHeight(host, plot) {
+                if (!w.Plotly || !host || !plot) return;
+                const doc = w.document;
+                const viewportH = Math.max(
+                  Number(w.innerHeight) || 0,
+                  Number(doc.documentElement && doc.documentElement.clientHeight) || 0
+                );
+                if (!Number.isFinite(viewportH) || viewportH <= 0) return;
+
+                const rect = host.getBoundingClientRect();
+                if (!rect || !Number.isFinite(rect.top)) return;
+
+                const bottomPadding = 14;
+                const available = Math.floor(viewportH - rect.top - bottomPadding);
+                const target = Math.max(620, Math.min(980, available));
+                if (!Number.isFinite(target) || target <= 0) return;
+
+                const prev = Number(host.getAttribute('data-zenith-fit-h') || '0');
+                if (Math.abs(prev - target) < 6) return;
+
+                host.setAttribute('data-zenith-fit-h', String(target));
+                host.style.minHeight = `${target}px`;
+                host.style.height = `${target}px`;
+                w.Plotly.relayout(plot, { height: target });
+              }
+
               function setupToolbar() {
                 const chartHosts = w.document.querySelectorAll('div[data-testid="stPlotlyChart"]');
                 if (!chartHosts.length) return false;
@@ -3358,6 +3416,7 @@ def main() -> None:
                 if (modebar) modebar.style.display = 'none';
 
                 bindYAxisCursor(host, plot);
+                fitPlotHeight(host, plot);
 
                 let tools = host.querySelector('.zenith-plot-tools');
                 if (!tools) {
@@ -3437,6 +3496,8 @@ def main() -> None:
                   tools.appendChild(resetBtn);
                   host.appendChild(tools);
                 }
+                setTimeout(() => fitPlotHeight(host, plot), 80);
+                setTimeout(() => fitPlotHeight(host, plot), 220);
                 return true;
               }
 
@@ -3452,6 +3513,16 @@ def main() -> None:
                 w.__zenithToolbarObserverBound = true;
                 const observer = new MutationObserver(() => setupToolbarWithRetry(0));
                 observer.observe(w.document.body, { childList: true, subtree: true });
+              }
+              if (!w.__zenithPlotResizeBound) {
+                w.__zenithPlotResizeBound = true;
+                let resizeTimer = null;
+                w.addEventListener('resize', () => {
+                  if (resizeTimer) {
+                    w.clearTimeout(resizeTimer);
+                  }
+                  resizeTimer = w.setTimeout(() => setupToolbarWithRetry(0), 120);
+                }, { passive: true });
               }
 
               setupToolbarWithRetry(0);
