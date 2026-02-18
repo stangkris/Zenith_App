@@ -50,7 +50,7 @@ STRATEGY_OPTIONS = [
     "Volume Profile (POC)",
 ]
 INTERVAL_OPTIONS = ["15min", "1h", "4h", "1day"]
-FIGURE_SCHEMA_VERSION = 10
+FIGURE_SCHEMA_VERSION = 11
 BACKTEST_CACHE_FILE = Path(__file__).with_name("backtest_trades.csv")
 BACKTEST_SCHEMA_VERSION = 3
 BACKTEST_DEFAULT_REFRESH_DAYS = 1
@@ -1055,7 +1055,8 @@ def inject_css(mini_mode: bool = False) -> None:
                 border: 1px solid #cbd5e1 !important;
                 border-radius: 14px !important;
                 box-shadow: 0 10px 25px rgba(15, 23, 42, 0.12) !important;
-                max-width: min(620px, 94vw) !important;
+                width: min(500px, 92vw) !important;
+                max-width: min(500px, 92vw) !important;
                 max-height: min(72vh, 640px) !important;
                 overflow-y: auto !important;
                 overflow-x: hidden !important;
@@ -1342,6 +1343,10 @@ def inject_css(mini_mode: bool = False) -> None:
                 display: flex;
                 flex-direction: column;
                 gap: 8px;
+                width: 100%;
+                max-width: 100%;
+                box-sizing: border-box;
+                overflow: hidden;
             }
 
             .summary-row {
@@ -1401,6 +1406,10 @@ def inject_css(mini_mode: bool = False) -> None:
                 background: #ffffff;
                 position: relative;
                 contain: layout paint style;
+            }
+
+            .stPlotlyChart > div {
+                overflow: hidden !important;
             }
 
             .stSelectbox label, .stTextInput label, .stRadio label, .stMarkdown, .stCaption {
@@ -2124,17 +2133,18 @@ def render_backtest_results_content(
 
     # Methodology notes (collapsible)
     html_parts.append(
-        f"<details style='{S['card']}cursor:pointer;'>"
+        f"<details style='{S['card']}cursor:pointer;max-width:100%;overflow:hidden;'>"
         "<summary style='font-size:13px;font-weight:700;color:#475569;"
         "letter-spacing:0.3px;list-style:none;'>"
         "\u2139\ufe0f \u0e2b\u0e21\u0e32\u0e22\u0e40\u0e2b\u0e15\u0e38\u0e27\u0e34\u0e18\u0e35\u0e04\u0e33\u0e19\u0e27\u0e13 \u25b8</summary>"
-        "<div style='margin-top:8px;font-size:12px;color:#64748b;line-height:1.6;'>"
-        "<div style='padding:3px 0;'>\u2022 \u0e43\u0e0a\u0e49\u0e2a\u0e31\u0e0d\u0e0d\u0e32\u0e13 \u201cBUY\u201d \u0e02\u0e2d\u0e07\u0e01\u0e25\u0e22\u0e38\u0e17\u0e18\u0e4c \u0e08\u0e33\u0e25\u0e2d\u0e07\u0e04\u0e33\u0e2a\u0e31\u0e48\u0e07 Entry/SL/TP (Structure Based)</div>"
-        "<div style='padding:3px 0;'>\u2022 <b>Realism</b>: Slippage 0.05% + Comm 0.1% + No Overlap</div>"
-        "<div style='padding:3px 0;'>\u2022 <b>Entry Fill</b>: รองรับ Market / Limit / Stop ตามกลยุทธ์</div>"
-        "<div style='padding:3px 0;'>\u2022 <b>Intrabar</b>: \u0e16\u0e49\u0e32\u0e41\u0e17\u0e48\u0e07\u0e40\u0e14\u0e35\u0e22\u0e27\u0e0a\u0e19 TP+SL \u2192 \u0e16\u0e37\u0e2d\u0e27\u0e48\u0e32\u0e41\u0e1e\u0e49</div>"
-        "<div style='padding:3px 0;'>\u2022 <b>Time Stop</b>: \u0e04\u0e23\u0e1a Horizon \u2192 \u0e1b\u0e34\u0e14\u0e17\u0e35\u0e48 Close</div>"
-        "<div style='padding:3px 0;'>\u2022 \u0e21\u0e35 cache \u0e40\u0e1e\u0e37\u0e48\u0e2d\u0e04\u0e33\u0e19\u0e27\u0e13\u0e40\u0e09\u0e1e\u0e32\u0e30\u0e02\u0e49\u0e2d\u0e21\u0e39\u0e25\u0e43\u0e2b\u0e21\u0e48</div>"
+        "<div style='margin-top:8px;font-size:12px;color:#64748b;line-height:1.6;overflow-wrap:anywhere;'>"
+        "<div style='padding:3px 0;'>1) สแกนสัญญาณจาก strategy ทีละแท่ง โดยใช้ผล <b>status = BUY</b></div>"
+        "<div style='padding:3px 0;'>2) ดึงแผนคำสั่งจากกลยุทธ์: <b>entry / sl / tp / order_type</b></div>"
+        "<div style='padding:3px 0;'>3) จำลองการ Fill ตามชนิดคำสั่ง: <b>market / limit / stop</b></div>"
+        "<div style='padding:3px 0;'>4) หลังเข้าแล้วตัดสินผลด้วย <b>TP/SL</b> และใช้กฎ <b>Intrabar แบบ Conservative</b></div>"
+        "<div style='padding:3px 0;'>5) ถ้าไม่ชน TP/SL ภายใน horizon จะปิดด้วย <b>Time Stop (close ของแท่งสุดท้าย)</b></div>"
+        "<div style='padding:3px 0;'>6) คิดต้นทุนจริง: <b>Slippage 0.05%</b> + <b>Commission 0.1%</b> และไม่เปิดไม้ซ้อน</div>"
+        "<div style='padding:3px 0;'>7) ใช้ cache แบบ incremental + data digest เพื่อลดเวลารัน และกันผลค้างเมื่อข้อมูลย้อนหลังเปลี่ยน</div>"
         "</div></details>"
     )
 
@@ -2336,6 +2346,10 @@ def make_figure(
     ]
 
     is_us_intraday = market_mode == "us_equity" and interval in {"15min", "1h", "4h"}
+    if is_us_intraday:
+        x_plot = plot_time.dt.strftime("%Y-%m-%d %H:%M")
+    else:
+        x_plot = plot_time
 
     fig = make_subplots(
         rows=3,
@@ -2352,7 +2366,7 @@ def make_figure(
 
     fig.add_trace(
         go.Candlestick(
-            x=plot_time,
+            x=x_plot,
             open=df["open"],
             high=df["high"],
             low=df["low"],
@@ -2379,12 +2393,13 @@ def make_figure(
 
     fig.add_trace(
         go.Bar(
-            x=plot_time,
+            x=x_plot,
             y=df["volume"],
             marker_color=vol_colors,
             name="Volume",
             showlegend=False,
-            hovertemplate="Date: %{x|%d %b %Y %H:%M}<br>Volume: %{y:,.0f}<extra></extra>",
+            customdata=plot_time,
+            hovertemplate="Date: %{customdata|%d %b %Y %H:%M}<br>Volume: %{y:,.0f}<extra></extra>",
         ),
         row=2,
         col=1,
@@ -2397,25 +2412,27 @@ def make_figure(
         ).tolist()
         fig.add_trace(
             go.Bar(
-                x=plot_time,
+                x=x_plot,
                 y=df["rsi14"],
                 marker_color=rsi_colors,
                 name="RSI Momentum",
                 showlegend=False,
                 opacity=0.95,
-                hovertemplate="Date: %{x|%d %b %Y %H:%M}<br>RSI: %{y:.2f}<extra></extra>",
+                customdata=plot_time,
+                hovertemplate="Date: %{customdata|%d %b %Y %H:%M}<br>RSI: %{y:.2f}<extra></extra>",
             ),
             row=3,
             col=1,
         )
         fig.add_trace(
             go.Scatter(
-                x=plot_time,
+                x=x_plot,
                 y=df["rsi14"],
                 name="RSI(14)",
                 line=dict(color="#0f172a", width=1.0),
                 showlegend=False,
-                hovertemplate="Date: %{x|%d %b %Y %H:%M}<br>RSI(14): %{y:.2f}<extra></extra>",
+                customdata=plot_time,
+                hovertemplate="Date: %{customdata|%d %b %Y %H:%M}<br>RSI(14): %{y:.2f}<extra></extra>",
             ),
             row=3,
             col=1,
@@ -2423,12 +2440,13 @@ def make_figure(
     else:
         fig.add_trace(
             go.Scatter(
-                x=plot_time,
+                x=x_plot,
                 y=df["rsi14"],
                 name="RSI(14)",
                 line=dict(color="#334155", width=1.9),
                 showlegend=False,
-                hovertemplate="Date: %{x|%d %b %Y %H:%M}<br>RSI(14): %{y:.2f}<extra></extra>",
+                customdata=plot_time,
+                hovertemplate="Date: %{customdata|%d %b %Y %H:%M}<br>RSI(14): %{y:.2f}<extra></extra>",
             ),
             row=3,
             col=1,
@@ -2441,31 +2459,41 @@ def make_figure(
         for zone in analysis.get("fvg_zones", [])[-4:]:
             x0_idx = zone["start_index"]
             if x0_idx < len(plot_time):
-                x0 = plot_time.iloc[x0_idx]
+                x0 = x_plot.iloc[x0_idx]
                 fig.add_shape(
-                    type="rect", xref="x", yref="y", x0=x0, x1=plot_time.iloc[-1], y0=zone["low"], y1=zone["high"],
+                    type="rect", xref="x", yref="y", x0=x0, x1=x_plot.iloc[-1], y0=zone["low"], y1=zone["high"],
                     fillcolor="rgba(147, 197, 253, 0.25)", line=dict(color="rgba(59,130,246,0.38)", width=1), row=1, col=1,
                 )
         for zone in analysis.get("ob_zones", [])[-4:]:
             x0_idx = zone["index"]
             if x0_idx < len(plot_time):
-                x0 = plot_time.iloc[x0_idx]
+                x0 = x_plot.iloc[x0_idx]
                 fig.add_shape(
-                    type="rect", xref="x", yref="y", x0=x0, x1=plot_time.iloc[-1], y0=zone["low"], y1=zone["high"],
+                    type="rect", xref="x", yref="y", x0=x0, x1=x_plot.iloc[-1], y0=zone["low"], y1=zone["high"],
                     fillcolor="rgba(110, 231, 183, 0.28)", line=dict(color="rgba(16,185,129,0.42)", width=1), row=1, col=1,
                 )
-        for bos in analysis.get("bos_events", [])[-8:]:
+        latest_close = float(df["close"].iloc[-1])
+        price_band = max(latest_close * 0.35, 1e-6)
+        recent_floor = max(0, len(df) - 900)
+        recent_bos: list[dict[str, Any]] = []
+        for bos in analysis.get("bos_events", []):
             idx = bos["index"]
-            if idx < len(plot_time):
-                fig.add_annotation(
-                    x=plot_time.iloc[idx], y=df["high"].iloc[idx], text="BOS", showarrow=True, arrowhead=2,
-                    font=dict(color="#1e3a8a", size=10), bgcolor="rgba(255,255,255,0.75)", bordercolor="rgba(147,197,253,0.7)",
-                    row=1, col=1,
-                )
+            if idx >= len(plot_time) or idx < recent_floor:
+                continue
+            y_val = float(df["high"].iloc[idx])
+            if abs(y_val - latest_close) <= price_band:
+                recent_bos.append(bos)
+        for bos in recent_bos[-6:]:
+            idx = bos["index"]
+            fig.add_annotation(
+                x=x_plot.iloc[idx], y=df["high"].iloc[idx], text="BOS", showarrow=True, arrowhead=2,
+                font=dict(color="#1e3a8a", size=10), bgcolor="rgba(255,255,255,0.75)", bordercolor="rgba(147,197,253,0.7)",
+                row=1, col=1,
+            )
 
     if selected_strategy == "Momentum Breakout (EMA50 + VCP)":
         fig.add_trace(
-            go.Scatter(x=plot_time, y=df["ema50"], mode="lines", line=dict(color="#2563eb", width=1.9), name="EMA 50"),
+            go.Scatter(x=x_plot, y=df["ema50"], mode="lines", line=dict(color="#2563eb", width=1.9), name="EMA 50"),
             row=1,
             col=1,
         )
@@ -2482,7 +2510,7 @@ def make_figure(
 
     if selected_strategy == "Pullback Reversal (EMA200 + Fib + RSI)":
         fig.add_trace(
-            go.Scatter(x=plot_time, y=df["ema200"], mode="lines", line=dict(color="#0f766e", width=2.0), name="EMA 200"),
+            go.Scatter(x=x_plot, y=df["ema200"], mode="lines", line=dict(color="#0f766e", width=2.0), name="EMA 200"),
         )
         fib = analysis["fib"]
         fib50, fib618 = fib["50"], fib["61_8"]
@@ -2492,13 +2520,13 @@ def make_figure(
         # Fib Zone
         low_idx = fib.get("low_idx", 0)
         if 0 <= low_idx < len(plot_time):
-            x0 = plot_time.iloc[low_idx]
+            x0 = x_plot.iloc[low_idx]
             fig.add_shape(
                 type="rect",
                 xref="x",
                 yref="y",
                 x0=x0,
-                x1=plot_time.iloc[-1],
+                x1=x_plot.iloc[-1],
                 y0=min(fib50, fib618),
                 y1=max(fib50, fib618),
                 fillcolor="rgba(254, 243, 199, 0.45)",
@@ -2592,13 +2620,28 @@ def make_figure(
     if is_us_intraday:
         # Use category axis for US intraday to fully compress non-trading gaps
         # (overnight/weekend/holiday) into a continuous candle sequence.
+        day_key = plot_time.dt.strftime("%Y-%m-%d")
+        is_first_of_day = day_key.ne(day_key.shift(1))
+        tick_vals = x_plot[is_first_of_day].tolist()
+        tick_text = plot_time[is_first_of_day].dt.strftime("%d %b").tolist()
+        max_ticks = 18
+        if len(tick_vals) > max_ticks:
+            step = int(np.ceil(len(tick_vals) / max_ticks))
+            tick_vals = tick_vals[::step]
+            tick_text = tick_text[::step]
         fig.update_xaxes(
             type="category",
+            categoryorder="array",
+            categoryarray=x_plot.tolist(),
             showgrid=True,
             gridcolor="#f1f5f9",
             fixedrange=False,
             spikecolor="#334155",
             spikethickness=1,
+            tickmode="array",
+            tickvals=tick_vals,
+            ticktext=tick_text,
+            tickangle=0,
         )
     else:
         fig.update_xaxes(
@@ -3547,10 +3590,10 @@ def main() -> None:
                 const rect = host.getBoundingClientRect();
                 if (!rect || !Number.isFinite(rect.top)) return;
 
-                const bottomPadding = 14;
+                const bottomPadding = 20;
                 const available = Math.floor(viewportH - rect.top - bottomPadding);
                 if (!Number.isFinite(available) || available <= 180) return;
-                const target = Math.floor(Math.min(920, available));
+                const target = Math.floor(Math.max(420, Math.min(900, available - 10)));
 
                 const prev = Number(host.getAttribute('data-zenith-fit-h') || '0');
                 if (Math.abs(prev - target) < 6) return;
@@ -3559,6 +3602,9 @@ def main() -> None:
                 host.style.minHeight = `${target}px`;
                 host.style.height = `${target}px`;
                 host.style.overflow = 'hidden';
+                if (host.parentElement) {
+                  host.parentElement.style.overflow = 'hidden';
+                }
                 api.relayout(plot, { height: target });
               }
 
