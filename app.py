@@ -54,6 +54,7 @@ FIGURE_SCHEMA_VERSION = 9
 BACKTEST_CACHE_FILE = Path(__file__).with_name("backtest_trades.csv")
 BACKTEST_SCHEMA_VERSION = 3
 BACKTEST_DEFAULT_REFRESH_DAYS = 1
+DATA_AUTO_REFRESH_SECONDS = 180
 BACKTEST_MAX_BARS = {
     "15min": 5000,
     "1h": 4000,
@@ -1632,7 +1633,8 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame | None:
 
 
 @st.cache_data(show_spinner=False, ttl=300)
-def fetch_ohlcv_twelvedata(symbol: str, api_key: str, interval: str) -> pd.DataFrame | None:
+def fetch_ohlcv_twelvedata(symbol: str, api_key: str, interval: str, cache_slot: int = 0) -> pd.DataFrame | None:
+    _ = cache_slot  # used as cache key to force periodic refresh
     # Scale the lookback window by timeframe so that larger intervals
     # have enough bars for the 220-bar warmup + scanning range.
     _fetch_days = {"15min": 300, "1h": 600, "4h": 1200, "1day": 2000}.get(interval, 365)
@@ -1932,6 +1934,32 @@ def _infer_us_intraday_hide_bounds_bkk(plot_time: pd.Series | None) -> tuple[flo
 
     close_min = (open_min + (6 * 60) + 30) % (24 * 60)
     return round(close_min / 60.0, 2), round(open_min / 60.0, 2)
+
+
+def _is_data_stale(ts: pd.Series, interval: str) -> bool:
+    if ts.empty:
+        return True
+    last_ts = pd.to_datetime(ts.iloc[-1], errors="coerce")
+    if pd.isna(last_ts):
+        return True
+
+    if isinstance(last_ts, pd.Timestamp):
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.tz_localize("Asia/Bangkok")
+        else:
+            last_ts = last_ts.tz_convert("Asia/Bangkok")
+
+    now_bkk = pd.Timestamp.now(tz="Asia/Bangkok")
+    age_seconds = max(float((now_bkk - last_ts).total_seconds()), 0.0)
+
+    bar_seconds = {
+        "15min": 15 * 60,
+        "1h": 60 * 60,
+        "4h": 4 * 60 * 60,
+        "1day": 24 * 60 * 60,
+    }.get(interval, 60 * 60)
+    stale_threshold = max(float(bar_seconds * 4), 6 * 60 * 60)
+    return age_seconds > stale_threshold
 
 
 def build_xaxis_rangebreaks(interval: str, market_mode: str, plot_time: pd.Series | None = None) -> list[dict[str, Any]]:
@@ -2701,6 +2729,8 @@ def main() -> None:
         st.session_state["cached_df"] = None
     if "cached_analysis" not in st.session_state:
         st.session_state["cached_analysis"] = None
+    if "cached_fetch_at" not in st.session_state:
+        st.session_state["cached_fetch_at"] = None
     if "cached_fig_key" not in st.session_state:
         st.session_state["cached_fig_key"] = None
     if "cached_fig" not in st.session_state:
@@ -2982,6 +3012,8 @@ def main() -> None:
 
     if refresh:
         st.session_state["run_analysis"] = True
+        st.session_state["cached_params"] = None
+        st.session_state["cached_fetch_at"] = None
         st.session_state["active_params"] = (
             st.session_state["ticker_sel"],
             st.session_state["interval_sel"],
@@ -3004,15 +3036,29 @@ def main() -> None:
 
     ticker, interval, strategy = st.session_state["active_params"]
     market_mode = resolve_market_mode_twelvedata(ticker, td_key)
+    last_fetch_at = st.session_state.get("cached_fetch_at")
+    auto_refresh_due = True
+    if isinstance(last_fetch_at, datetime):
+        auto_refresh_due = (datetime.utcnow() - last_fetch_at).total_seconds() >= DATA_AUTO_REFRESH_SECONDS
+    cached_df_obj = st.session_state.get("cached_df")
+    data_stale = bool(
+        isinstance(cached_df_obj, pd.DataFrame)
+        and (not cached_df_obj.empty)
+        and _is_data_stale(cached_df_obj["timestamp"], interval)
+    )
+
     needs_refresh = (
         st.session_state["cached_params"] != st.session_state["active_params"]
         or st.session_state["cached_df"] is None
         or st.session_state["cached_analysis"] is None
+        or auto_refresh_due
+        or data_stale
     )
 
     if needs_refresh:
         with st.spinner("กำลังดึงข้อมูลและวิเคราะห์..."):
-            df = fetch_ohlcv_twelvedata(ticker, td_key, interval)
+            fetch_slot = int(datetime.utcnow().timestamp() // DATA_AUTO_REFRESH_SECONDS)
+            df = fetch_ohlcv_twelvedata(ticker, td_key, interval, fetch_slot)
 
         if df is None or len(df) < 60:
             st.warning("ข้อมูลไม่เพียงพอสำหรับการวิเคราะห์ (ต้องการอย่างน้อย 60 แท่ง)")
@@ -3022,6 +3068,7 @@ def main() -> None:
         st.session_state["cached_df"] = df
         st.session_state["cached_analysis"] = analysis
         st.session_state["cached_params"] = st.session_state["active_params"]
+        st.session_state["cached_fetch_at"] = datetime.utcnow()
     else:
         df = st.session_state["cached_df"]
         analysis = st.session_state["cached_analysis"]
