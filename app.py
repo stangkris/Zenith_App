@@ -76,6 +76,10 @@ BACKTEST_STRATEGY_LOOKBACK = {
 }
 
 
+class BacktestCanceledError(Exception):
+    """Raised when a running backtest is canceled by the user."""
+
+
 def _backtest_signal_bounds(total_bars: int, interval: str) -> tuple[int | None, int | None, int]:
     if total_bars <= 0 or total_bars < BACKTEST_MIN_WARMUP:
         return None, None, 0
@@ -911,12 +915,14 @@ def inject_css(mini_mode: bool = False) -> None:
                 background: linear-gradient(180deg, var(--bg-main) 0%, var(--bg-soft) 100%);
                 color: var(--text);
                 min-height: 100vh;
-                overflow: hidden !important;
+                overflow-x: hidden !important;
+                overflow-y: auto !important;
             }
 
             html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
-                height: 100vh;
-                overflow: hidden !important;
+                min-height: 100vh;
+                overflow-x: hidden !important;
+                overflow-y: auto !important;
             }
 
             .block-container {
@@ -925,14 +931,16 @@ def inject_css(mini_mode: bool = False) -> None:
                 padding-left: 1rem;
                 padding-right: 1rem;
                 max-width: 1860px;
-                height: calc(100vh - 0.35rem);
-                overflow: hidden !important;
+                min-height: calc(100vh - 0.35rem);
+                height: auto;
+                overflow: visible !important;
             }
 
             .block-container > div[data-testid="stVerticalBlock"] {
                 gap: var(--section-gap);
-                height: 100%;
-                overflow: hidden !important;
+                min-height: 100%;
+                height: auto;
+                overflow: visible !important;
             }
 
             [data-testid="stSidebar"] {
@@ -2356,7 +2364,7 @@ def make_figure(
         cols=1,
         shared_xaxes=True,
         vertical_spacing=0.014,
-        row_heights=[0.62, 0.19, 0.19],
+        row_heights=[0.60, 0.18, 0.22],
         subplot_titles=(
             "MAIN CHART (OHLC + STRATEGY ZONES)",
             "VOLUME",
@@ -2544,7 +2552,7 @@ def make_figure(
     fig.update_layout(
         template="plotly_white",
         height=chart_height,
-        margin=dict(l=12, r=12, t=28, b=2),
+        margin=dict(l=12, r=12, t=28, b=24),
         legend=dict(
             orientation="h",
             yanchor="bottom",
@@ -2736,11 +2744,22 @@ def render_top_stats(df: pd.DataFrame, ticker: str, interval: str, market_mode: 
     color = "#0f766e" if chg >= 0 else "#b91c1c"
     phase = market_phase_context(df["timestamp"].iloc[-1])
 
-    c1, c2, c3, c4 = st.columns(4, gap="small")
-    c1.markdown(f"<div class='stat-card'><div class='tiny-label'>ชื่อหุ้น (Symbol)</div><div class='stat-value'>{ticker}</div></div>", unsafe_allow_html=True)
-    c2.markdown(f"<div class='stat-card'><div class='tiny-label'>Timeframe</div><div class='stat-value'>{interval}</div></div>", unsafe_allow_html=True)
-    c3.markdown(f"<div class='stat-card'><div class='tiny-label'>ราคาล่าสุด (USD)</div><div class='stat-value'>{fmt2(last_close)}</div></div>", unsafe_allow_html=True)
-    c4.markdown(
+    left_cards, right_card = st.columns([3.0, 1.0], gap="small")
+    with left_cards:
+        c1, c2, c3 = st.columns(3, gap="small")
+        c1.markdown(
+            f"<div class='stat-card'><div class='tiny-label'>ชื่อหุ้น (Symbol)</div><div class='stat-value'>{ticker}</div></div>",
+            unsafe_allow_html=True,
+        )
+        c2.markdown(
+            f"<div class='stat-card'><div class='tiny-label'>Timeframe</div><div class='stat-value'>{interval}</div></div>",
+            unsafe_allow_html=True,
+        )
+        c3.markdown(
+            f"<div class='stat-card'><div class='tiny-label'>ราคาล่าสุด (USD)</div><div class='stat-value'>{fmt2(last_close)}</div></div>",
+            unsafe_allow_html=True,
+        )
+    right_card.markdown(
         (
             "<div class='stat-card'>"
             f"<div class='tiny-label' style='white-space: nowrap;'>เปลี่ยนแปลง (Daily Change vs Prev Session) • <span class='phase-pill' style='color:{color}; border-color:{color};'>{phase}</span></div>"
@@ -2797,6 +2816,8 @@ def main() -> None:
         st.session_state["request_run_backtest"] = False
     if "backtest_is_running" not in st.session_state:
         st.session_state["backtest_is_running"] = False
+    if "backtest_cancel_requested" not in st.session_state:
+        st.session_state["backtest_cancel_requested"] = False
     if "backtest_progress_pct" not in st.session_state:
         st.session_state["backtest_progress_pct"] = 0
     if "backtest_progress_text" not in st.session_state:
@@ -3133,6 +3154,8 @@ def main() -> None:
         st.session_state["backtest_progress_text"] = ""
 
     top_container = st.container()
+    run_bt_top = False
+    cancel_bt_top = False
     with top_container:
         st.markdown("<div class='topbar-card-marker'></div>", unsafe_allow_html=True)
         cols = st.columns([2.6, 1.1, 1.1, 1.1], gap="small")
@@ -3157,15 +3180,22 @@ def main() -> None:
                 )
 
         with cols[2]:
-            run_bt_top = st.button(
-                "🚀 Run Backtest",
-                key="run_backtest_top",
-                use_container_width=True,
-                disabled=bool(
-                    st.session_state.get("request_run_backtest")
-                    or st.session_state.get("backtest_is_running")
-                ),
+            bt_busy = bool(
+                st.session_state.get("request_run_backtest")
+                or st.session_state.get("backtest_is_running")
             )
+            if bt_busy:
+                cancel_bt_top = st.button(
+                    "🛑 Cancel Backtest",
+                    key="cancel_backtest_top",
+                    use_container_width=True,
+                )
+            else:
+                run_bt_top = st.button(
+                    "🚀 Run Backtest",
+                    key="run_backtest_top",
+                    use_container_width=True,
+                )
 
         with cols[3]:
             with st.popover("📊 Backtest Results", use_container_width=True):
@@ -3174,9 +3204,20 @@ def main() -> None:
     if run_bt_top:
         st.session_state["request_run_backtest"] = True
         st.session_state["backtest_is_running"] = True
+        st.session_state["backtest_cancel_requested"] = False
         st.session_state["backtest_error"] = None
         st.session_state["backtest_progress_pct"] = 0
         st.session_state["backtest_progress_text"] = f"Backtest {ticker}: เตรียมข้อมูล 0%"
+        st.rerun()
+
+    if cancel_bt_top and (
+        st.session_state.get("request_run_backtest")
+        or st.session_state.get("backtest_is_running")
+    ):
+        current_pct = int(st.session_state.get("backtest_progress_pct", 0) or 0)
+        st.session_state["backtest_cancel_requested"] = True
+        st.session_state["backtest_progress_pct"] = max(0, min(current_pct, 99))
+        st.session_state["backtest_progress_text"] = f"Backtest {ticker}: กำลังยกเลิก..."
         st.rerun()
 
     bt_progress_text = str(st.session_state.get("backtest_progress_text", "")).strip()
@@ -3194,6 +3235,9 @@ def main() -> None:
         state = {"last_pct": max(int(bt_progress_pct), -1)}
 
         def on_backtest_progress(stage: str, done: int, total: int) -> None:
+            if st.session_state.get("backtest_cancel_requested") and stage not in {"finalize", "complete"}:
+                raise BacktestCanceledError("Backtest canceled by user")
+
             total_safe = max(int(total), 1)
             done_safe = max(0, min(int(done), total_safe))
             ratio = float(done_safe) / float(total_safe)
@@ -3219,7 +3263,10 @@ def main() -> None:
                 state["last_pct"] = pct
 
         _bt_ok = False
+        _bt_canceled = False
         try:
+            if st.session_state.get("backtest_cancel_requested"):
+                raise BacktestCanceledError("Backtest canceled by user")
             bt_summary, bt_cache_hit = _get_backtest_summary(
                 df, ticker, interval, strategy, market_mode, progress_callback=on_backtest_progress
             )
@@ -3231,6 +3278,13 @@ def main() -> None:
             st.session_state["backtest_progress_text"] = f"Backtest {ticker}: สรุปผล 100%"
             progress.progress(100, text=st.session_state["backtest_progress_text"])
             _bt_ok = True
+        except BacktestCanceledError:
+            _bt_canceled = True
+            keep_pct = max(0, min(int(st.session_state.get("backtest_progress_pct", 0) or 0), 99))
+            st.session_state["backtest_error"] = None
+            st.session_state["backtest_progress_pct"] = keep_pct
+            st.session_state["backtest_progress_text"] = f"Backtest {ticker}: ยกเลิกแล้ว"
+            progress.progress(keep_pct, text=st.session_state["backtest_progress_text"])
         except Exception as exc:
             st.session_state["backtest_params"] = current_bt_params
             st.session_state["backtest_summary"] = None
@@ -3240,6 +3294,7 @@ def main() -> None:
         # Always clean up running flags
         st.session_state["request_run_backtest"] = False
         st.session_state["backtest_is_running"] = False
+        st.session_state["backtest_cancel_requested"] = False
         st.session_state["backtest_progress_pct"] = 0
         st.session_state["backtest_progress_text"] = ""
         top_progress_slot.empty()
@@ -3256,6 +3311,12 @@ def main() -> None:
                     f"สัญญาณ {sig_c} รายการ  •  ชนะ {win_c} / แพ้ {loss_c}\n"
                     f"Win Rate {win_r:.1f}%"
                 ),
+            }
+        elif _bt_canceled:
+            st.session_state["_bt_popup"] = {
+                "type": "cancel",
+                "title": f"🛑 Backtest {ticker} ถูกยกเลิก",
+                "detail": "หยุดการคำนวณตามคำสั่งผู้ใช้แล้ว",
             }
         else:
             err_msg = st.session_state.get("backtest_error", "Unknown error")
@@ -3279,8 +3340,15 @@ def main() -> None:
         _pop_type = html.escape(str(_bt_popup.get("type", "success")))
         _pop_title = html.escape(str(_bt_popup.get("title", "")))
         _pop_detail = html.escape(str(_bt_popup.get("detail", ""))).replace("\n", "<br>")
-        _pop_bg = "#0f766e" if _pop_type == "success" else "#b91c1c"
-        _pop_icon = "🎯" if _pop_type == "success" else "⚠️"
+        if _pop_type == "success":
+            _pop_bg = "#0f766e"
+            _pop_icon = "🎯"
+        elif _pop_type == "cancel":
+            _pop_bg = "#b45309"
+            _pop_icon = "🛑"
+        else:
+            _pop_bg = "#b91c1c"
+            _pop_icon = "⚠️"
         components.html(
             f"""
             <script>
@@ -3369,7 +3437,7 @@ def main() -> None:
     left, right = st.columns([3.0, 1.0], gap="small")
 
     with left:
-        chart_height = 560
+        chart_height = 620
         fig_key = (
             ticker,
             interval,
@@ -3590,21 +3658,15 @@ def main() -> None:
                 const rect = host.getBoundingClientRect();
                 if (!rect || !Number.isFinite(rect.top)) return;
 
-                const bottomPadding = 20;
+                const bottomPadding = 48;
                 const available = Math.floor(viewportH - rect.top - bottomPadding);
-                if (!Number.isFinite(available) || available <= 180) return;
-                const target = Math.floor(Math.max(420, Math.min(900, available - 10)));
+                if (!Number.isFinite(available) || available <= 220) return;
+                const target = Math.floor(Math.max(500, Math.min(760, available)));
 
                 const prev = Number(host.getAttribute('data-zenith-fit-h') || '0');
                 if (Math.abs(prev - target) < 6) return;
 
                 host.setAttribute('data-zenith-fit-h', String(target));
-                host.style.minHeight = `${target}px`;
-                host.style.height = `${target}px`;
-                host.style.overflow = 'hidden';
-                if (host.parentElement) {
-                  host.parentElement.style.overflow = 'hidden';
-                }
                 api.relayout(plot, { height: target });
               }
 
