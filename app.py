@@ -123,6 +123,29 @@ def _compute_source_digest(df: pd.DataFrame) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _slice_df_by_time(df: pd.DataFrame, start: pd.Timestamp | None, end: pd.Timestamp | None) -> pd.DataFrame:
+    if df.empty or "timestamp" not in df.columns:
+        return pd.DataFrame(columns=df.columns)
+
+    ts = pd.to_datetime(df["timestamp"], errors="coerce")
+    mask = ts.notna()
+    if start is not None and not pd.isna(start):
+        mask &= ts >= start
+    if end is not None and not pd.isna(end):
+        mask &= ts <= end
+    return df.loc[mask].copy()
+
+
+def _compute_tail_digest(df: pd.DataFrame, bars: int, end: pd.Timestamp | None = None) -> str:
+    bars = max(int(bars), 0)
+    if bars <= 0:
+        return ""
+    scope = _slice_df_by_time(df, None, end)
+    if scope.empty:
+        return ""
+    return _compute_source_digest(scope.tail(bars))
+
+
 
 def _strategy_signal_series(
     df: pd.DataFrame,
@@ -194,6 +217,8 @@ def _load_backtest_cache() -> pd.DataFrame:
         "data_start",
         "data_end",
         "data_digest",
+        "tail_bars",
+        "tail_digest",
     ]:
         if col not in cached.columns:
             cached[col] = np.nan
@@ -592,6 +617,25 @@ def _append_and_dedup_trades(existing: pd.DataFrame, new: pd.DataFrame) -> pd.Da
     return combined
 
 
+def _trim_trades_to_source_range(
+    trades: pd.DataFrame,
+    source_start: pd.Timestamp | None,
+    source_end: pd.Timestamp | None,
+) -> pd.DataFrame:
+    if trades.empty:
+        return trades
+    if "entry_time" not in trades.columns:
+        return trades
+
+    entry_time = pd.to_datetime(trades["entry_time"], errors="coerce")
+    keep = pd.Series(True, index=trades.index, dtype=bool)
+    if source_start is not None and not pd.isna(source_start):
+        keep &= entry_time.isna() | (entry_time >= source_start)
+    if source_end is not None and not pd.isna(source_end):
+        keep &= entry_time.isna() | (entry_time <= source_end)
+    return trades[keep].copy()
+
+
 def _get_last_exit_time(trades: pd.DataFrame) -> pd.Timestamp | None:
     if trades.empty or "exit_time" not in trades.columns:
         return None
@@ -618,6 +662,9 @@ def _get_backtest_summary(
     source_start = pd.to_datetime(df["timestamp"].iloc[0], errors="coerce") if total_bars else pd.NaT
     source_end = pd.to_datetime(df["timestamp"].iloc[-1], errors="coerce") if total_bars else pd.NaT
     source_digest = _compute_source_digest(df)
+    lookback = max(int(BACKTEST_STRATEGY_LOOKBACK.get(interval, 800)), BACKTEST_MIN_WARMUP)
+    horizon = int(BACKTEST_HORIZON_BARS.get(interval, 12))
+    continuity_bars = lookback + horizon + 8
 
     if cached.empty:
         key_mask = pd.Series(False, index=cached.index, dtype=bool)
@@ -640,13 +687,21 @@ def _get_backtest_summary(
 
     meta_rows = cached[meta_mask].copy() if not cached.empty else pd.DataFrame()
     last_refresh: pd.Timestamp | None = None
+    cached_data_start: pd.Timestamp | None = None
     cached_data_end: pd.Timestamp | None = None
     cached_data_digest = ""
+    cached_tail_bars = 0
+    cached_tail_digest = ""
     if not meta_rows.empty:
         try:
             last_refresh = pd.to_datetime(meta_rows["exit_time"].iloc[-1], errors="coerce")
         except Exception:
             last_refresh = None
+        if "data_start" in meta_rows.columns:
+            try:
+                cached_data_start = pd.to_datetime(meta_rows["data_start"].iloc[-1], errors="coerce")
+            except Exception:
+                cached_data_start = None
         if "data_end" in meta_rows.columns:
             try:
                 cached_data_end = pd.to_datetime(meta_rows["data_end"].iloc[-1], errors="coerce")
@@ -657,6 +712,16 @@ def _get_backtest_summary(
                 cached_data_digest = str(meta_rows["data_digest"].iloc[-1] or "").strip()
             except Exception:
                 cached_data_digest = ""
+        if "tail_bars" in meta_rows.columns:
+            try:
+                cached_tail_bars = int(pd.to_numeric(meta_rows["tail_bars"].iloc[-1], errors="coerce"))
+            except Exception:
+                cached_tail_bars = 0
+        if "tail_digest" in meta_rows.columns:
+            try:
+                cached_tail_digest = str(meta_rows["tail_digest"].iloc[-1] or "").strip()
+            except Exception:
+                cached_tail_digest = ""
 
     # Split meta and trades
     if not key_rows.empty and "exit_reason" in key_rows.columns:
@@ -664,34 +729,38 @@ def _get_backtest_summary(
     else:
         trades = key_rows.copy() if not key_rows.empty else pd.DataFrame()
     trades = _canonicalize_trade_log(trades)
+    trades = _trim_trades_to_source_range(trades, source_start, source_end)
 
-    # Reuse cache if source range didn't move forward AND didn't expand backward.
-    cached_data_start: pd.Timestamp | None = None
-    if not meta_rows.empty and "data_start" in meta_rows.columns:
-        try:
-            cached_data_start = pd.to_datetime(meta_rows["data_start"].iloc[-1], errors="coerce")
-        except Exception:
-            cached_data_start = None
+    has_cached_range = (
+        cached_data_start is not None
+        and cached_data_end is not None
+        and not pd.isna(cached_data_start)
+        and not pd.isna(cached_data_end)
+    )
+    cache_hit = bool(
+        has_cached_range
+        and not _should_refresh_backtest_cache(last_refresh)
+        and (source_start == cached_data_start)
+        and (source_end == cached_data_end)
+        and bool(cached_data_digest)
+        and (source_digest == cached_data_digest)
+    )
 
-    force_full_recalc = False
-    if cached_data_end is not None and not pd.isna(cached_data_end) and not pd.isna(source_end):
-        end_ok = bool(source_end <= cached_data_end)
-        # Also invalidate if the new source starts earlier than what was cached
-        # (e.g. fetch window expanded from 183 → 540 days).
-        if cached_data_start is not None and not pd.isna(cached_data_start) and not pd.isna(source_start):
-            start_ok = bool(source_start >= cached_data_start)
-        else:
-            start_ok = True
-        cache_hit = end_ok and start_ok
-    else:
-        cache_hit = bool((not trades.empty) and (not _should_refresh_backtest_cache(last_refresh)))
-
-    if not cached_data_digest:
-        cache_hit = False
-        force_full_recalc = True
-    elif source_digest and cached_data_digest != source_digest:
-        cache_hit = False
-        force_full_recalc = True
+    force_full_recalc = True
+    if not cache_hit:
+        has_new_tail = bool(
+            has_cached_range
+            and not pd.isna(source_end)
+            and source_end > cached_data_end
+            and bool(cached_tail_digest)
+            and cached_tail_bars > 0
+        )
+        if has_new_tail:
+            # Compare historical tail up to the previous cache end.
+            # If unchanged, we can safely calculate only newly appended bars.
+            current_tail_digest = _compute_tail_digest(df, cached_tail_bars, end=cached_data_end)
+            if current_tail_digest and current_tail_digest == cached_tail_digest:
+                force_full_recalc = False
 
     def run_backtest_window(df_window: pd.DataFrame) -> tuple[pd.Series, pd.DataFrame]:
         sig = _strategy_signal_series(
@@ -714,9 +783,6 @@ def _get_backtest_summary(
     if not cache_hit:
         if progress_callback:
             progress_callback("prepare", 1, 1)
-        lookback = max(int(BACKTEST_STRATEGY_LOOKBACK.get(interval, 800)), BACKTEST_MIN_WARMUP)
-        horizon = int(BACKTEST_HORIZON_BARS.get(interval, 12))
-        continuity_bars = lookback + horizon + 8
 
         anchor_ts = cached_data_end
         if anchor_ts is None or pd.isna(anchor_ts):
@@ -751,6 +817,10 @@ def _get_backtest_summary(
 
         # Append + dedup
         trades = _append_and_dedup_trades(trades, new_trades)
+        trades = _trim_trades_to_source_range(trades, source_start, source_end)
+
+        tail_bars = max(int(continuity_bars), 120)
+        tail_digest = _compute_tail_digest(df, tail_bars, end=source_end)
 
         # Write back: keep other keys, replace this key's trades + meta
         remaining = cached[~key_mask] if not cached.empty else pd.DataFrame()
@@ -774,6 +844,8 @@ def _get_backtest_summary(
                     "data_start": source_start,
                     "data_end": source_end,
                     "data_digest": source_digest,
+                    "tail_bars": tail_bars,
+                    "tail_digest": tail_digest,
                 }
             ]
         )
@@ -2662,6 +2734,14 @@ def make_figure(
             rangebreaks=build_xaxis_rangebreaks(interval, market_mode, plot_time),
             tickformat="%d %b\n%H:%M" if interval in ("15min", "1h", "4h") else "%d %b\n%Y",
         )
+
+    focus_bars = {"15min": 260, "1h": 220, "4h": 180, "1day": 240}.get(interval, 220)
+    if len(df) > int(focus_bars):
+        start_idx = max(0, len(df) - int(focus_bars))
+        if is_us_intraday:
+            fig.update_xaxes(range=[float(start_idx) - 0.5, float(len(df)) - 0.5])
+        else:
+            fig.update_xaxes(range=[x_plot.iloc[start_idx], x_plot.iloc[-1]])
 
     vol_ceiling = float(df["volume"].quantile(0.97))
     if vol_ceiling > 0:
