@@ -901,8 +901,12 @@ def _get_backtest_summary(
     return summary, cache_hit
 
 
+APP_ICON_PATH = Path(__file__).with_name("icon").joinpath("Zenith-icon.png")
+APP_PAGE_ICON = str(APP_ICON_PATH) if APP_ICON_PATH.exists() else "📈"
+
 st.set_page_config(
     page_title="Zenith | Elite Stock Analysis",
+    page_icon=APP_PAGE_ICON,
     layout="wide",
     initial_sidebar_state="expanded",
 )
